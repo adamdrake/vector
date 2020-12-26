@@ -196,7 +196,7 @@ heim = { version = "0.1.0-rc.1", optional = true, features = ["full"] }
 rust_decimal = "1.8.1"
 mongodb = { version = "1.1.1", optional = true }
 anyhow = { version = "1.0.36" }
-snap = { version = "1.0.2", optional = true }
+snap = { version = "1.0.3", optional = true }
 dyn-clone = "1.0.3"
 indoc = "1.0.3"
 avro-rs = { version = "0.12.0", git = "https://github.com/flavray/avro-rs", rev = "f28acbbb9860bd62cb24ead83878d7526d075454", optional = true }
