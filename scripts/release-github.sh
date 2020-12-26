@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+#!/bin/bash
+set -euo pipefail
 
 # release-github.sh
 #
@@ -6,7 +7,9 @@
 #
 #   Uploads target/artifacts to Github releases
 
-set -eu
+VERSION="${VECTOR_VERSION:-"$(scripts/version.sh)"}"
 
-echo "Adding release to Github"
-grease create-release timberio/vector v$VERSION $CIRCLE_SHA1 --assets "target/artifacts/*"
+grease --debug create-release timberio/vector "v${VERSION}" "${SHA1}" \
+  --assets './target/artifacts/*' \
+  --notes "[View release notes](https://vector.dev/releases/${VERSION}/)" \
+  --name "v${VERSION}"

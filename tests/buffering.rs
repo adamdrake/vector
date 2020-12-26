@@ -1,320 +1,131 @@
-use futures::Future;
-use prost::Message;
+#![cfg(feature = "leveldb")]
+
+use futures::{compat::Future01CompatExt, SinkExt, StreamExt};
 use tempfile::tempdir;
-use vector::event::{self, Event};
-use vector::test_util::{
-    block_on, next_addr, random_lines, receive, send_lines, shutdown_on_idle, wait_for_tcp,
+use tokio::runtime::Runtime;
+use tracing::trace;
+use vector::{
+    buffers::BufferConfig,
+    config,
+    test_util::{
+        random_events_with_stream, runtime, start_topology, trace_init, wait_for_atomic_usize,
+        CountReceiver,
+    },
+    topology,
 };
-use vector::topology::{self, config};
-use vector::{buffers::BufferConfig, sinks, sources};
+
+mod support;
+
+fn terminate_abruptly(rt: Runtime, topology: topology::RunningTopology) {
+    drop(rt);
+    drop(topology);
+}
 
 #[test]
 fn test_buffering() {
+    trace_init();
+
     let data_dir = tempdir().unwrap();
     let data_dir = data_dir.path().to_path_buf();
+    trace!(message = "Test data dir", ?data_dir);
 
-    let num_lines: usize = 10;
+    let num_events: usize = 10;
+    let line_length = 100;
+    let max_size = 10_000;
+    let expected_events_count = num_events * 2;
 
-    let in_addr = next_addr();
-    let out_addr = next_addr();
-
-    // Run vector while sink server is not running, and then shut it down abruptly
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+    assert!(
+        line_length * expected_events_count <= max_size,
+        "Test parameters are invalid, this test implies  that all lines will fit
+        into the buffer, but the buffer is not big enough"
     );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size: 10_000,
-        when_full: Default::default(),
+
+    // Run vector with a dead sink, and then shut it down without sink ever
+    // accepting any data.
+    let (in_tx, source_config, source_event_counter) = support::source_with_event_counter();
+    let sink_config = support::sink_dead();
+    let config = {
+        let mut config = config::Config::builder();
+        config.add_source("in", source_config);
+        config.add_sink("out", &["in"], sink_config);
+        config.sinks["out"].buffer = BufferConfig::Disk {
+            max_size,
+            when_full: Default::default(),
+        };
+        config.global.data_dir = Some(data_dir.clone());
+        config.build().unwrap()
     };
-    config.data_dir = Some(data_dir.clone());
 
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let mut rt = runtime();
+    let (topology, input_events) = rt.block_on(async move {
+        let (topology, _crash) = start_topology(config, false).await;
+        let (input_events, input_events_stream) =
+            random_events_with_stream(line_length, num_events);
+        let mut input_events_stream = input_events_stream.map(Ok);
 
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-    wait_for_tcp(in_addr);
+        let _ = in_tx
+            .sink_map_err(|error| panic!(error))
+            .send_all(&mut input_events_stream)
+            .await
+            .unwrap();
 
-    let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    rt.block_on(send).unwrap();
+        // We need to wait for at least the source to process events.
+        // This is to avoid a race after we send all events, at that point two things
+        // can happen in any order, we reaching `terminate_abruptly` and source processing
+        // all of the events. We need for the source to process events before `terminate_abruptly`
+        // so we wait for that here.
+        wait_for_atomic_usize(source_event_counter, |x| x == num_events).await;
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+        (topology, input_events)
+    });
 
-    rt.shutdown_now().wait().unwrap();
-    drop(topology);
+    // Now we give it some time for the events to propagate to File.
+    // This is to avoid a race after the source processes all events, at that point two things
+    // can happen in any order, we reaching `terminate_abruptly` and events being written
+    // to file. We need for the events to be written to the file before `terminate_abruptly`.
+    // We can't know when exactly all of the events have been written, so we have to guess.
+    // But it should be shortly after source processing all of the events.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Simulate a crash.
+    terminate_abruptly(rt, topology);
 
-    // Start sink server, then run vector again. It should send all of the lines from the first run.
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size: 10_000,
-        when_full: Default::default(),
+    // Then run vector again with a sink that accepts events now. It should
+    // send all of the events from the first run.
+    let (in_tx, source_config) = support::source();
+    let (out_rx, sink_config) = support::sink(10);
+    let config = {
+        let mut config = config::Config::builder();
+        config.add_source("in", source_config);
+        config.add_sink("out", &["in"], sink_config);
+        config.sinks["out"].buffer = BufferConfig::Disk {
+            max_size,
+            when_full: Default::default(),
+        };
+        config.global.data_dir = Some(data_dir);
+        config.build().unwrap()
     };
-    config.data_dir = Some(data_dir);
 
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let mut rt = runtime();
+    rt.block_on(async move {
+        let (topology, _crash) = start_topology(config, false).await;
 
-    let output_lines = receive(&out_addr);
+        let (input_events2, input_events_stream) =
+            random_events_with_stream(line_length, num_events);
+        let mut input_events_stream = input_events_stream.map(Ok);
 
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
+        let _ = in_tx
+            .sink_map_err(|error| panic!(error))
+            .send_all(&mut input_events_stream)
+            .await
+            .unwrap();
 
-    wait_for_tcp(in_addr);
+        let output_events = CountReceiver::receive_events(out_rx);
 
-    let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines2.clone().into_iter());
-    rt.block_on(send).unwrap();
+        topology.stop().compat().await.unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    block_on(topology.stop()).unwrap();
-
-    shutdown_on_idle(rt);
-
-    let output_lines = output_lines.wait();
-    assert_eq!(num_lines * 2, output_lines.len());
-    assert_eq!(input_lines, &output_lines[..num_lines]);
-    assert_eq!(input_lines2, &output_lines[num_lines..]);
-}
-
-#[test]
-fn test_max_size() {
-    let data_dir = tempdir().unwrap();
-    let data_dir = data_dir.path().to_path_buf();
-
-    let num_lines: usize = 1000;
-    let line_size = 1000;
-    let input_lines = random_lines(line_size).take(num_lines).collect::<Vec<_>>();
-
-    let max_size = input_lines
-        .clone()
-        .into_iter()
-        .take(num_lines / 2)
-        .map(|line| {
-            let mut e = Event::from(line);
-            e.as_mut_log()
-                .insert_implicit("host".into(), "127.0.0.1".into());
-            event::proto::EventWrapper::from(e)
-        })
-        .map(|ew| ew.encoded_len())
-        .sum();
-
-    let in_addr = next_addr();
-    let out_addr = next_addr();
-
-    // Run vector while sink server is not running, and then shut it down abruptly
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size,
-        when_full: Default::default(),
-    };
-    config.data_dir = Some(data_dir.clone());
-
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-    wait_for_tcp(in_addr);
-
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    rt.block_on(send).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    rt.shutdown_now().wait().unwrap();
-    drop(topology);
-
-    // Start sink server, then run vector again. It should send the lines from the first run that fit in the limited space
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size,
-        when_full: Default::default(),
-    };
-    config.data_dir = Some(data_dir);
-
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let output_lines = receive(&out_addr);
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-
-    wait_for_tcp(in_addr);
-
-    block_on(topology.stop()).unwrap();
-
-    shutdown_on_idle(rt);
-
-    let output_lines = output_lines.wait();
-    assert_eq!(num_lines / 2, output_lines.len());
-    assert_eq!(&input_lines[..num_lines / 2], &output_lines[..]);
-}
-
-#[test]
-fn test_max_size_resume() {
-    let data_dir = tempdir().unwrap();
-    let data_dir = data_dir.path().to_path_buf();
-
-    let num_lines: usize = 1000;
-    let line_size = 1000;
-    let max_size = num_lines * line_size / 2;
-
-    let in_addr1 = next_addr();
-    let in_addr2 = next_addr();
-    let out_addr = next_addr();
-
-    let mut config = config::Config::empty();
-    config.add_source("in1", sources::tcp::TcpConfig::new(in_addr1));
-    config.add_source("in2", sources::tcp::TcpConfig::new(in_addr2));
-    config.add_sink(
-        "out",
-        &["in1", "in2"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size,
-        when_full: Default::default(),
-    };
-    config.data_dir = Some(data_dir.clone());
-
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-    wait_for_tcp(in_addr1);
-    wait_for_tcp(in_addr2);
-
-    // Send all of the input lines _before_ the output sink is ready. This causes the writers to stop
-    // writing to the on-disk buffer, and once the output sink is available and the size of the buffer
-    // begins to decrease, they should starting writing again.
-    let input_lines1 = random_lines(line_size).take(num_lines).collect::<Vec<_>>();
-    let send1 = send_lines(in_addr1, input_lines1.clone().into_iter());
-    let input_lines2 = random_lines(line_size).take(num_lines).collect::<Vec<_>>();
-    let send2 = send_lines(in_addr2, input_lines2.clone().into_iter());
-    rt.block_on(send1.join(send2)).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let output_lines = receive(&out_addr);
-
-    block_on(topology.stop()).unwrap();
-
-    shutdown_on_idle(rt);
-
-    let output_lines = output_lines.wait();
-    assert_eq!(num_lines * 2, output_lines.len());
-}
-
-#[test]
-#[ignore]
-fn test_reclaim_disk_space() {
-    let data_dir = tempdir().unwrap();
-    let data_dir = data_dir.path().to_path_buf();
-
-    let num_lines: usize = 10_000;
-    let line_size = 1000;
-
-    let in_addr = next_addr();
-    let out_addr = next_addr();
-
-    // Run vector while sink server is not running, and then shut it down abruptly
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size: 1_000_000_000,
-        when_full: Default::default(),
-    }
-    .into();
-    config.data_dir = Some(data_dir.clone());
-
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-    wait_for_tcp(in_addr);
-
-    let input_lines = random_lines(line_size).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    rt.block_on(send).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    rt.shutdown_now().wait().unwrap();
-    drop(topology);
-
-    let before_disk_size: u64 = walkdir::WalkDir::new(&data_dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|m| m.len())
-        .sum();
-
-    // Start sink server, then run vector again. It should send all of the lines from the first run.
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-    config.sinks["out"].buffer = BufferConfig::Disk {
-        max_size: 1_000_000_000,
-        when_full: Default::default(),
-    };
-    config.data_dir = Some(data_dir.clone());
-
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let output_lines = receive(&out_addr);
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-
-    wait_for_tcp(in_addr);
-
-    let input_lines2 = random_lines(line_size).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines2.clone().into_iter());
-    rt.block_on(send).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
-    block_on(topology.stop()).unwrap();
-
-    shutdown_on_idle(rt);
-
-    let output_lines = output_lines.wait();
-    assert_eq!(num_lines * 2 - 1, output_lines.len());
-    assert_eq!(&input_lines[1..], &output_lines[..num_lines - 1]);
-    assert_eq!(input_lines2, &output_lines[num_lines - 1..]);
-
-    let after_disk_size: u64 = walkdir::WalkDir::new(&data_dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|m| m.len())
-        .sum();
-
-    println!("after {}, before {}", after_disk_size, before_disk_size);
-    assert!(after_disk_size < before_disk_size);
+        let output_events = output_events.await;
+        assert_eq!(expected_events_count, output_events.len());
+        assert_eq!(input_events, &output_events[..num_events]);
+        assert_eq!(input_events2, &output_events[num_events..]);
+    });
 }

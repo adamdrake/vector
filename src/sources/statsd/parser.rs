@@ -1,8 +1,8 @@
-use crate::event::{metric::Direction, Metric};
+use crate::event::metric::{Metric, MetricKind, MetricValue, StatisticKind};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     error, fmt,
     num::{ParseFloatError, ParseIntError},
 };
@@ -56,44 +56,74 @@ pub fn parse(packet: &str) -> Result<Metric, ParseError> {
     let metric = match metric_type {
         "c" => {
             let val: f64 = parts[0].parse()?;
-            Metric::Counter {
+            Metric {
                 name,
-                val: val * sample_rate,
+                namespace: None,
                 timestamp: None,
                 tags,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter {
+                    value: val * sample_rate,
+                },
             }
         }
-        unit @ "h" | unit @ "ms" => {
+        unit @ "h" | unit @ "ms" | unit @ "d" => {
             let val: f64 = parts[0].parse()?;
-            Metric::Histogram {
+            Metric {
                 name,
-                val: convert_to_base_units(unit, val),
-                sample_rate: sample_rate as u32,
+                namespace: None,
                 timestamp: None,
                 tags,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Distribution {
+                    values: vec![convert_to_base_units(unit, val)],
+                    sample_rates: vec![sample_rate as u32],
+                    statistic: convert_to_statistic(unit),
+                },
             }
         }
-        "g" => Metric::Gauge {
-            name,
-            val: if parts[0]
+        "g" => {
+            let value = if parts[0]
                 .chars()
                 .next()
                 .map(|c| c.is_ascii_digit())
-                .ok_or_else(|| ParseError::Malformed("empty first body component"))?
+                .ok_or(ParseError::Malformed("empty first body component"))?
             {
                 parts[0].parse()?
             } else {
                 parts[0][1..].parse()?
-            },
-            direction: parse_direction(parts[0])?,
-            timestamp: None,
-            tags,
-        },
-        "s" => Metric::Set {
+            };
+
+            match parse_direction(parts[0])? {
+                None => Metric {
+                    name,
+                    namespace: None,
+                    timestamp: None,
+                    tags,
+                    kind: MetricKind::Absolute,
+                    value: MetricValue::Gauge { value },
+                },
+                Some(sign) => Metric {
+                    name,
+                    namespace: None,
+                    timestamp: None,
+                    tags,
+                    kind: MetricKind::Incremental,
+                    value: MetricValue::Gauge {
+                        value: value * sign,
+                    },
+                },
+            }
+        }
+        "s" => Metric {
             name,
-            val: parts[0].into(),
+            namespace: None,
             timestamp: None,
             tags,
+            kind: MetricKind::Incremental,
+            value: MetricValue::Set {
+                values: vec![parts[0].into()].into_iter().collect(),
+            },
         },
         other => return Err(ParseError::UnknownMetricType(other.into())),
     };
@@ -115,14 +145,14 @@ fn parse_sampling(input: &str) -> Result<f64, ParseError> {
     }
 }
 
-fn parse_tags(input: &str) -> Result<HashMap<String, String>, ParseError> {
+fn parse_tags(input: &str) -> Result<BTreeMap<String, String>, ParseError> {
     if !input.starts_with('#') || input.len() < 2 {
         return Err(ParseError::Malformed(
             "expected non empty '#'-prefixed tags component",
         ));
     }
 
-    let mut result = HashMap::new();
+    let mut result = BTreeMap::new();
 
     let chunks = input[1..].split(',').collect::<Vec<_>>();
     for chunk in chunks {
@@ -138,14 +168,14 @@ fn parse_tags(input: &str) -> Result<HashMap<String, String>, ParseError> {
     Ok(result)
 }
 
-fn parse_direction(input: &str) -> Result<Option<Direction>, ParseError> {
+fn parse_direction(input: &str) -> Result<Option<f64>, ParseError> {
     match input
         .chars()
         .next()
-        .ok_or_else(|| ParseError::Malformed("empty body component"))?
+        .ok_or(ParseError::Malformed("empty body component"))?
     {
-        '+' => Ok(Some(Direction::Plus)),
-        '-' => Ok(Some(Direction::Minus)),
+        '+' => Ok(Some(1.0)),
+        '-' => Ok(Some(-1.0)),
         c if c.is_ascii_digit() => Ok(None),
         _other => Err(ParseError::Malformed("invalid gauge value prefix")),
     }
@@ -173,6 +203,13 @@ fn convert_to_base_units(unit: &str, val: f64) -> f64 {
     }
 }
 
+fn convert_to_statistic(unit: &str) -> StatisticKind {
+    match unit {
+        "d" => StatisticKind::Summary,
+        _ => StatisticKind::Histogram,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ParseError {
     Malformed(&'static str),
@@ -183,9 +220,7 @@ pub enum ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            anything => write!(f, "Statsd parse error: {:?}", anything),
-        }
+        write!(f, "Statsd parse error: {:?}", self)
     }
 }
 
@@ -206,17 +241,19 @@ impl From<ParseFloatError> for ParseError {
 #[cfg(test)]
 mod test {
     use super::{parse, sanitize_key, sanitize_sampling};
-    use crate::event::{metric::Direction, Metric};
+    use crate::event::metric::{Metric, MetricKind, MetricValue, StatisticKind};
 
     #[test]
     fn basic_counter() {
         assert_eq!(
             parse("foo:1|c"),
-            Ok(Metric::Counter {
+            Ok(Metric {
                 name: "foo".into(),
-                val: 1.0,
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }),
         );
     }
@@ -225,9 +262,9 @@ mod test {
     fn tagged_counter() {
         assert_eq!(
             parse("foo:1|c|#tag1,tag2:value"),
-            Ok(Metric::Counter {
+            Ok(Metric {
                 name: "foo".into(),
-                val: 1.0,
+                namespace: None,
                 timestamp: None,
                 tags: Some(
                     vec![
@@ -237,6 +274,8 @@ mod test {
                     .into_iter()
                     .collect(),
                 ),
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 1.0 },
             }),
         );
     }
@@ -245,11 +284,13 @@ mod test {
     fn sampled_counter() {
         assert_eq!(
             parse("bar:2|c|@0.1"),
-            Ok(Metric::Counter {
+            Ok(Metric {
                 name: "bar".into(),
-                val: 20.0,
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 20.0 },
             }),
         );
     }
@@ -258,11 +299,13 @@ mod test {
     fn zero_sampled_counter() {
         assert_eq!(
             parse("bar:2|c|@0"),
-            Ok(Metric::Counter {
+            Ok(Metric {
                 name: "bar".into(),
-                val: 2.0,
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Counter { value: 2.0 },
             }),
         );
     }
@@ -271,12 +314,17 @@ mod test {
     fn sampled_timer() {
         assert_eq!(
             parse("glork:320|ms|@0.1"),
-            Ok(Metric::Histogram {
+            Ok(Metric {
                 name: "glork".into(),
-                val: 0.320,
-                sample_rate: 10,
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Distribution {
+                    values: vec![0.320],
+                    sample_rates: vec![10],
+                    statistic: StatisticKind::Histogram
+                },
             }),
         );
     }
@@ -285,10 +333,9 @@ mod test {
     fn sampled_tagged_histogram() {
         assert_eq!(
             parse("glork:320|h|@0.1|#region:us-west1,production,e:"),
-            Ok(Metric::Histogram {
+            Ok(Metric {
                 name: "glork".into(),
-                val: 320.0,
-                sample_rate: 10,
+                namespace: None,
                 timestamp: None,
                 tags: Some(
                     vec![
@@ -299,6 +346,39 @@ mod test {
                     .into_iter()
                     .collect(),
                 ),
+                kind: MetricKind::Incremental,
+                value: MetricValue::Distribution {
+                    values: vec![320.0],
+                    sample_rates: vec![10],
+                    statistic: StatisticKind::Histogram
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn sampled_distribution() {
+        assert_eq!(
+            parse("glork:320|d|@0.1|#region:us-west1,production,e:"),
+            Ok(Metric {
+                name: "glork".into(),
+                namespace: None,
+                timestamp: None,
+                tags: Some(
+                    vec![
+                        ("region".to_owned(), "us-west1".to_owned()),
+                        ("production".to_owned(), "true".to_owned()),
+                        ("e".to_owned(), "".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                kind: MetricKind::Incremental,
+                value: MetricValue::Distribution {
+                    values: vec![320.0],
+                    sample_rates: vec![10],
+                    statistic: StatisticKind::Summary
+                },
             }),
         );
     }
@@ -307,12 +387,13 @@ mod test {
     fn simple_gauge() {
         assert_eq!(
             parse("gaugor:333|g"),
-            Ok(Metric::Gauge {
+            Ok(Metric {
                 name: "gaugor".into(),
-                val: 333.0,
-                direction: None,
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Absolute,
+                value: MetricValue::Gauge { value: 333.0 },
             }),
         );
     }
@@ -321,22 +402,24 @@ mod test {
     fn signed_gauge() {
         assert_eq!(
             parse("gaugor:-4|g"),
-            Ok(Metric::Gauge {
+            Ok(Metric {
                 name: "gaugor".into(),
-                val: 4.0,
-                direction: Some(Direction::Minus),
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Gauge { value: -4.0 },
             }),
         );
         assert_eq!(
             parse("gaugor:+10|g"),
-            Ok(Metric::Gauge {
+            Ok(Metric {
                 name: "gaugor".into(),
-                val: 10.0,
-                direction: Some(Direction::Plus),
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Gauge { value: 10.0 },
             }),
         );
     }
@@ -345,11 +428,15 @@ mod test {
     fn sets() {
         assert_eq!(
             parse("uniques:765|s"),
-            Ok(Metric::Set {
+            Ok(Metric {
                 name: "uniques".into(),
-                val: "765".into(),
+                namespace: None,
                 timestamp: None,
                 tags: None,
+                kind: MetricKind::Incremental,
+                value: MetricValue::Set {
+                    values: vec!["765".into()].into_iter().collect()
+                },
             }),
         );
     }

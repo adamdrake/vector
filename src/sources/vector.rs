@@ -1,52 +1,96 @@
-use super::util::TcpSource;
+use super::util::{SocketListenAddr, TcpSource};
 use crate::{
+    config::{DataType, GenerateConfig, GlobalOptions, Resource, SourceConfig, SourceDescription},
     event::proto,
-    topology::config::{DataType, GlobalOptions, SourceConfig},
-    Event,
+    internal_events::{VectorEventReceived, VectorProtoDecodeError},
+    shutdown::ShutdownSignal,
+    tcp::TcpKeepaliveConfig,
+    tls::{MaybeTlsSettings, TlsConfig},
+    Event, Pipeline,
 };
 use bytes::{Bytes, BytesMut};
-use futures::sync::mpsc;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use tokio::codec::LengthDelimitedCodec;
-use tracing::field;
+use tokio_util::codec::LengthDelimitedCodec;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct VectorConfig {
-    pub address: SocketAddr,
+    pub address: SocketListenAddr,
+    pub keepalive: Option<TcpKeepaliveConfig>,
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    tls: Option<TlsConfig>,
 }
 
 fn default_shutdown_timeout_secs() -> u64 {
     30
 }
 
+#[cfg(test)]
 impl VectorConfig {
-    pub fn new(address: SocketAddr) -> Self {
+    pub fn new(
+        address: SocketListenAddr,
+        keepalive: Option<TcpKeepaliveConfig>,
+        tls: Option<TlsConfig>,
+    ) -> Self {
         Self {
             address,
+            keepalive,
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            tls,
         }
     }
 }
 
+inventory::submit! {
+    SourceDescription::new::<VectorConfig>("vector")
+}
+
+impl GenerateConfig for VectorConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(Self {
+            address: SocketListenAddr::SocketAddr("0.0.0.0:9000".parse().unwrap()),
+            keepalive: None,
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            tls: None,
+        })
+        .unwrap()
+    }
+}
+
+#[async_trait::async_trait]
 #[typetag::serde(name = "vector")]
 impl SourceConfig for VectorConfig {
-    fn build(
+    async fn build(
         &self,
         _name: &str,
         _globals: &GlobalOptions,
-        out: mpsc::Sender<Event>,
-    ) -> Result<super::Source, String> {
+        shutdown: ShutdownSignal,
+        out: Pipeline,
+    ) -> crate::Result<super::Source> {
         let vector = VectorSource;
-        vector.run(self.address, self.shutdown_timeout_secs, out)
+        let tls = MaybeTlsSettings::from_config(&self.tls, true)?;
+        vector.run(
+            self.address,
+            self.keepalive,
+            self.shutdown_timeout_secs,
+            tls,
+            shutdown,
+            out,
+        )
     }
 
     fn output_type(&self) -> DataType {
-        DataType::Log
+        DataType::Any
+    }
+
+    fn source_type(&self) -> &'static str {
+        "vector"
+    }
+
+    fn resources(&self) -> Vec<Resource> {
+        vec![self.address.into()]
     }
 }
 
@@ -54,54 +98,71 @@ impl SourceConfig for VectorConfig {
 struct VectorSource;
 
 impl TcpSource for VectorSource {
+    type Error = std::io::Error;
     type Decoder = LengthDelimitedCodec;
 
     fn decoder(&self) -> Self::Decoder {
         LengthDelimitedCodec::new()
     }
 
-    fn build_event(&self, frame: BytesMut, _host: Option<Bytes>) -> Option<Event> {
+    fn build_event(&self, frame: BytesMut, _host: Bytes) -> Option<Event> {
+        let byte_size = frame.len();
         match proto::EventWrapper::decode(frame).map(Event::from) {
             Ok(event) => {
-                trace!(
-                    message = "Received one event.",
-                    event = field::debug(&event)
-                );
+                emit!(VectorEventReceived { byte_size });
                 Some(event)
             }
-            Err(e) => {
-                error!("failed to parse protobuf message: {:?}", e);
+            Err(error) => {
+                emit!(VectorProtoDecodeError { error });
                 None
             }
         }
     }
 }
 
+#[cfg(feature = "sinks-vector")]
 #[cfg(test)]
 mod test {
     use super::VectorConfig;
+    use crate::shutdown::ShutdownSignal;
     use crate::{
-        buffers::Acker,
-        sinks::vector::vector,
-        test_util::{next_addr, wait_for_tcp, CollectCurrent},
-        topology::config::{GlobalOptions, SourceConfig},
-        Event,
+        config::{GlobalOptions, SinkConfig, SinkContext, SourceConfig},
+        event::{
+            metric::{MetricKind, MetricValue},
+            Metric,
+        },
+        sinks::vector::VectorSinkConfig,
+        test_util::{collect_ready, next_addr, wait_for_tcp},
+        tls::{TlsConfig, TlsOptions},
+        Event, Pipeline,
     };
-    use futures::{stream, sync::mpsc, Future, Sink};
+    use futures::stream;
+    use std::net::SocketAddr;
+    use tokio::time::{delay_for, Duration};
 
     #[test]
-    fn tcp_it_works_with_vector_sink() {
-        let (tx, rx) = mpsc::channel(100);
+    fn generate_config() {
+        crate::test_util::test_generate_config::<VectorConfig>();
+    }
 
-        let addr = next_addr();
-        let server = VectorConfig::new(addr.clone())
-            .build("default", &GlobalOptions::default(), tx)
+    async fn stream_test(addr: SocketAddr, source: VectorConfig, sink: VectorSinkConfig) {
+        let (tx, rx) = Pipeline::new_test();
+
+        let server = source
+            .build(
+                "default",
+                &GlobalOptions::default(),
+                ShutdownSignal::noop(),
+                tx,
+            )
+            .await
             .unwrap();
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
-        rt.spawn(server);
-        wait_for_tcp(addr);
+        tokio::spawn(server);
+        wait_for_tcp(addr).await;
 
-        let sink = vector("NONE".into(), addr, Acker::Null);
+        let cx = SinkContext::new_test();
+        let (sink, _) = sink.build(cx).await.unwrap();
+
         let events = vec![
             Event::from("test"),
             Event::from("events"),
@@ -111,15 +172,57 @@ mod test {
             Event::from("sink"),
             Event::from("and"),
             Event::from("source"),
+            Event::Metric(Metric {
+                name: String::from("also test a metric"),
+                namespace: None,
+                timestamp: None,
+                tags: None,
+                kind: MetricKind::Absolute,
+                value: MetricValue::Counter { value: 1.0 },
+            }),
         ];
 
-        let _ = rt
-            .block_on(sink.send_all(stream::iter_ok(events.clone().into_iter())))
-            .unwrap();
+        sink.run(stream::iter(events.clone())).await.unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        delay_for(Duration::from_millis(50)).await;
 
-        let (_, output) = CollectCurrent::new(rx).wait().unwrap();
+        let output = collect_ready(rx).await;
         assert_eq!(events, output);
+    }
+
+    #[tokio::test]
+    async fn it_works_with_vector_sink() {
+        let addr = next_addr();
+        stream_test(
+            addr,
+            VectorConfig::new(addr.into(), None, None),
+            VectorSinkConfig {
+                address: format!("localhost:{}", addr.port()),
+                keepalive: None,
+                tls: None,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn it_works_with_vector_sink_tls() {
+        let addr = next_addr();
+        stream_test(
+            addr,
+            VectorConfig::new(addr.into(), None, Some(TlsConfig::test_config())),
+            VectorSinkConfig {
+                address: format!("localhost:{}", addr.port()),
+                keepalive: None,
+                tls: Some(TlsConfig {
+                    enabled: Some(true),
+                    options: TlsOptions {
+                        verify_certificate: Some(false),
+                        ..Default::default()
+                    },
+                }),
+            },
+        )
+        .await;
     }
 }

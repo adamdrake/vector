@@ -1,227 +1,327 @@
-use approx::assert_relative_eq;
-use futures::{Future, Sink, Stream};
-use std::{collections::HashMap, thread, time::Duration};
-use tokio::codec::{FramedWrite, LinesCodec};
-use tokio_uds::UnixStream;
-use vector::test_util::{
-    block_on, next_addr, random_lines, receive, send_lines, shutdown_on_idle, wait_for_tcp,
-};
-use vector::topology::{self, config};
+#![cfg(all(feature = "sources-syslog", feature = "sinks-socket"))]
+
+use bytes::Bytes;
+use futures::compat::Future01CompatExt;
+use rand::{thread_rng, Rng};
+use serde::Deserialize;
+use serde_json::Value;
+use sinks::socket::{self, SocketSinkConfig};
+use sinks::util::{encoding::EncodingConfig, tcp::TcpSinkConfig, Encoding};
+use std::{collections::HashMap, fmt, str::FromStr};
+use tokio_util::codec::BytesCodec;
 use vector::{
-    sinks,
+    config, sinks,
     sources::syslog::{Mode, SyslogConfig},
+    test_util::{
+        next_addr, random_maps, random_string, send_encodable, send_lines, start_topology,
+        trace_init, wait_for_tcp, CountReceiver,
+    },
 };
 
-#[test]
-fn test_tcp_syslog() {
-    let num_lines: usize = 10000;
+#[tokio::test]
+async fn test_tcp_syslog() {
+    let num_messages: usize = 10000;
 
     let in_addr = next_addr();
     let out_addr = next_addr();
 
-    let mut config = config::Config::empty();
-    config.add_source("in", SyslogConfig::new(Mode::Tcp { address: in_addr }));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+    let mut config = config::Config::builder();
+    config.add_source(
+        "in",
+        SyslogConfig::new(Mode::Tcp {
+            address: in_addr.into(),
+            keepalive: None,
+            tls: None,
+        }),
     );
+    config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
 
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let output_lines = CountReceiver::receive_lines(out_addr);
 
-    let output_lines = receive(&out_addr);
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
+    let (topology, _crash) = start_topology(config.build().unwrap(), false).await;
     // Wait for server to accept traffic
-    wait_for_tcp(in_addr);
+    wait_for_tcp(in_addr).await;
 
-    let input_lines = random_lines(100)
-        .enumerate()
-        .map(|(id, line)| generate_rfc5424_log_line(id, line))
-        .take(num_lines)
-        .collect::<Vec<_>>();
+    let input_messages: Vec<SyslogMessageRFC5424> = (0..num_messages)
+        .map(|i| SyslogMessageRFC5424::random(i, 30, 4, 3, 3))
+        .collect();
 
-    block_on(send_lines(in_addr, input_lines.clone().into_iter())).unwrap();
+    let input_lines: Vec<String> = input_messages.iter().map(|msg| msg.to_string()).collect();
 
-    // Shut down server
-    block_on(topology.stop()).unwrap();
-
-    shutdown_on_idle(rt);
-    let output_lines = output_lines.wait();
-    assert_eq!(num_lines, output_lines.len());
-    assert_eq!(input_lines, output_lines);
-}
-
-#[test]
-fn test_udp_syslog() {
-    let num_lines: usize = 1000;
-
-    let in_addr = next_addr();
-    let out_addr = next_addr();
-
-    let mut config = config::Config::empty();
-    config.add_source("in", SyslogConfig::new(Mode::Udp { address: in_addr }));
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
-
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-
-    let output_lines = receive(&out_addr);
-
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
-
-    let input_lines = random_lines(100)
-        .enumerate()
-        .map(|(id, line)| generate_rfc5424_log_line(id, line))
-        .take(num_lines)
-        .collect::<Vec<_>>();
-
-    let bind_addr = next_addr();
-    let socket = std::net::UdpSocket::bind(&bind_addr).unwrap();
-    for line in input_lines.iter() {
-        socket.send_to(line.as_bytes(), &in_addr).unwrap();
-        // Space things out slightly to try to avoid dropped packets
-        thread::sleep(Duration::from_nanos(200_000));
-    }
-
-    // Give packets some time to flow through
-    thread::sleep(Duration::from_millis(10));
+    send_lines(in_addr, input_lines).await.unwrap();
 
     // Shut down server
-    block_on(topology.stop()).unwrap();
+    topology.stop().compat().await.unwrap();
 
-    shutdown_on_idle(rt);
-    let output_lines = output_lines.wait();
+    let output_lines = output_lines.await;
+    assert_eq!(output_lines.len(), num_messages);
 
-    // Account for some dropped packets :(
-    let output_lines_ratio = output_lines.len() as f32 / num_lines as f32;
-    assert_relative_eq!(output_lines_ratio, 1.0, epsilon = 0.01);
-    for line in output_lines {
-        assert!(input_lines.contains(&line));
-    }
+    let output_messages: Vec<SyslogMessageRFC5424> = output_lines
+        .iter()
+        .map(|s| {
+            let mut value = Value::from_str(s).unwrap();
+            value.as_object_mut().unwrap().remove("hostname"); // Vector adds this field which will cause a parse error.
+            value.as_object_mut().unwrap().remove("source_ip"); // Vector adds this field which will cause a parse error.
+            serde_json::from_value(value).unwrap()
+        })
+        .collect();
+    assert_eq!(output_messages, input_messages);
 }
 
-#[test]
-fn test_unix_stream_syslog() {
-    let num_lines: usize = 10000;
+#[cfg(unix)]
+#[tokio::test]
+async fn test_unix_stream_syslog() {
+    use futures::{stream, SinkExt, StreamExt};
+    use tokio::{net::UnixStream, task::yield_now};
+    use tokio_util::codec::{FramedWrite, LinesCodec};
+
+    let num_messages: usize = 10000;
 
     let in_path = tempfile::tempdir().unwrap().into_path().join("stream_test");
     let out_addr = next_addr();
 
-    let mut config = config::Config::empty();
+    let mut config = config::Config::builder();
     config.add_source(
         "in",
         SyslogConfig::new(Mode::Unix {
             path: in_path.clone(),
         }),
     );
-    config.add_sink(
-        "out",
-        &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
-    );
+    config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
 
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
+    let output_lines = CountReceiver::receive_lines(out_addr);
 
-    let output_lines = receive(&out_addr);
+    let (topology, _crash) = start_topology(config.build().unwrap(), false).await;
 
-    let (topology, _crash) = topology::start(config, &mut rt, false).unwrap();
     // Wait for server to accept traffic
-    while let Err(_) = std::os::unix::net::UnixStream::connect(&in_path) {}
+    while std::os::unix::net::UnixStream::connect(&in_path).is_err() {
+        yield_now().await;
+    }
 
-    let input_lines = random_lines(100)
-        .enumerate()
-        .map(|(id, line)| generate_rfc5424_log_line(id, line))
-        .take(num_lines)
-        .collect::<Vec<_>>();
+    let input_messages: Vec<SyslogMessageRFC5424> = (0..num_messages)
+        .map(|i| SyslogMessageRFC5424::random(i, 30, 4, 3, 3))
+        .collect();
 
-    let input_stream = futures::stream::iter_ok::<_, ()>(input_lines.clone().into_iter());
+    let stream = UnixStream::connect(&in_path).await.unwrap();
+    let mut sink = FramedWrite::new(stream, LinesCodec::new());
 
-    UnixStream::connect(&in_path)
-        .map_err(|e| panic!("{:}", e))
-        .and_then(|socket| {
-            let out =
-                FramedWrite::new(socket, LinesCodec::new()).sink_map_err(|e| panic!("{:?}", e));
+    let lines: Vec<String> = input_messages.iter().map(|msg| msg.to_string()).collect();
+    let mut lines = stream::iter(lines).map(Ok);
+    sink.send_all(&mut lines).await.unwrap();
 
-            input_stream
-                .forward(out)
-                .map(|(_source, sink)| sink)
-                .and_then(|sink| {
-                    let socket = sink.into_inner().into_inner();
-                    tokio::io::shutdown(socket)
-                        .map(|_| ())
-                        .map_err(|e| panic!("{:}", e))
-                })
-        })
-        .wait()
-        .unwrap();
+    let stream = sink.get_mut();
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
+
+    // Otherwise some lines will be lost
+    tokio::time::delay_for(std::time::Duration::from_millis(1000)).await;
 
     // Shut down server
-    block_on(topology.stop()).unwrap();
+    topology.stop().compat().await.unwrap();
 
-    shutdown_on_idle(rt);
-    let output_lines = output_lines.wait();
-    assert_eq!(num_lines, output_lines.len());
-    assert_eq!(input_lines, output_lines);
+    let output_lines = output_lines.await;
+    assert_eq!(output_lines.len(), num_messages);
+
+    let output_messages: Vec<SyslogMessageRFC5424> = output_lines
+        .iter()
+        .map(|s| {
+            let mut value = Value::from_str(s).unwrap();
+            value.as_object_mut().unwrap().remove("hostname"); // Vector adds this field which will cause a parse error.
+            value.as_object_mut().unwrap().remove("source_ip"); // Vector adds this field which will cause a parse error.
+            serde_json::from_value(value).unwrap()
+        })
+        .collect();
+    assert_eq!(output_messages, input_messages);
 }
 
-fn generate_rfc5424_log_line(msg_id: usize, msg: String) -> String {
-    let severity = Severity::LOG_INFO;
-    let facility = Facility::LOG_USER;
-    let hostname = "hogwarts";
-    let process = "harry";
-    let pid = 42;
-    let data = StructuredData::new();
+#[tokio::test]
+async fn test_octet_counting_syslog() {
+    trace_init();
 
-    format!(
-        "<{}>{} {} {} {} {} {} {} {}",
-        encode_priority(severity, facility),
-        1, // version
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        hostname,
-        process,
-        pid,
-        msg_id,
-        format_5424_structured_data(data),
-        msg
-    )
+    let num_messages: usize = 10000;
+
+    let in_addr = next_addr();
+    let out_addr = next_addr();
+
+    let mut config = config::Config::builder();
+    config.add_source(
+        "in",
+        SyslogConfig::new(Mode::Tcp {
+            address: in_addr.into(),
+            keepalive: None,
+            tls: None,
+        }),
+    );
+    config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
+
+    let output_lines = CountReceiver::receive_lines(out_addr);
+
+    let (topology, _crash) = start_topology(config.build().unwrap(), false).await;
+    // Wait for server to accept traffic
+    wait_for_tcp(in_addr).await;
+
+    let input_messages: Vec<SyslogMessageRFC5424> = (0..num_messages)
+        .map(|i| {
+            let mut msg = SyslogMessageRFC5424::random(i, 30, 4, 3, 3);
+            msg.message.push('\n');
+            msg.message.push_str(&random_string(30));
+            msg
+        })
+        .collect();
+
+    let codec = BytesCodec::new();
+    let input_lines: Vec<Bytes> = input_messages
+        .iter()
+        .map(|msg| {
+            let s = msg.to_string();
+            format!("{} {}", s.len(), s).into()
+        })
+        .collect();
+
+    send_encodable(in_addr, codec, input_lines).await.unwrap();
+
+    // Shut down server
+    topology.stop().compat().await.unwrap();
+
+    let output_lines = output_lines.await;
+    assert_eq!(output_lines.len(), num_messages);
+
+    let output_messages: Vec<SyslogMessageRFC5424> = output_lines
+        .iter()
+        .map(|s| {
+            let mut value = Value::from_str(s).unwrap();
+            value.as_object_mut().unwrap().remove("hostname"); // Vector adds this field which will cause a parse error.
+            value.as_object_mut().unwrap().remove("source_ip"); // Vector adds this field which will cause a parse error.
+            serde_json::from_value(value).unwrap()
+        })
+        .collect();
+    assert_eq!(output_messages, input_messages);
+}
+
+#[derive(Deserialize, PartialEq, Clone, Debug)]
+struct SyslogMessageRFC5424 {
+    msgid: String,
+    severity: Severity,
+    facility: Facility,
+    version: u8,
+    timestamp: String,
+    host: String,
+    source_type: String,
+    appname: String,
+    procid: usize,
+    message: String,
+    #[serde(flatten)]
+    structured_data: StructuredData,
+}
+
+impl SyslogMessageRFC5424 {
+    fn random(
+        id: usize,
+        msg_len: usize,
+        field_len: usize,
+        max_map_size: usize,
+        max_children: usize,
+    ) -> Self {
+        let msg = random_string(msg_len);
+        let structured_data = random_structured_data(max_map_size, max_children, field_len);
+
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        //"secfrac" can contain up to 6 digits, but TCP sinks uses `AutoSi`
+
+        Self {
+            msgid: format!("test{}", id),
+            severity: Severity::LOG_INFO,
+            facility: Facility::LOG_USER,
+            version: 1,
+            timestamp,
+            host: "hogwarts".to_owned(),
+            source_type: "syslog".to_owned(),
+            appname: "harry".to_owned(),
+            procid: thread_rng().gen_range(0, 32768),
+            structured_data,
+            message: msg,
+        }
+    }
+}
+
+impl fmt::Display for SyslogMessageRFC5424 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "<{}>{} {} {} {} {} {} {} {}",
+            encode_priority(self.severity, self.facility),
+            self.version,
+            self.timestamp,
+            self.host,
+            self.appname,
+            self.procid,
+            self.msgid,
+            format_structured_data_rfc5424(&self.structured_data),
+            self.message
+        )
+    }
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Deserialize, PartialEq, Debug)]
 pub enum Severity {
+    #[serde(rename(deserialize = "emergency"))]
     LOG_EMERG,
+    #[serde(rename(deserialize = "alert"))]
     LOG_ALERT,
+    #[serde(rename(deserialize = "critical"))]
     LOG_CRIT,
+    #[serde(rename(deserialize = "error"))]
     LOG_ERR,
+    #[serde(rename(deserialize = "warn"))]
     LOG_WARNING,
+    #[serde(rename(deserialize = "notice"))]
     LOG_NOTICE,
+    #[serde(rename(deserialize = "info"))]
     LOG_INFO,
+    #[serde(rename(deserialize = "debug"))]
     LOG_DEBUG,
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, PartialEq, Deserialize, Debug)]
 pub enum Facility {
+    #[serde(rename(deserialize = "kernel"))]
     LOG_KERN = 0 << 3,
+    #[serde(rename(deserialize = "user"))]
     LOG_USER = 1 << 3,
+    #[serde(rename(deserialize = "mail"))]
     LOG_MAIL = 2 << 3,
+    #[serde(rename(deserialize = "daemon"))]
     LOG_DAEMON = 3 << 3,
+    #[serde(rename(deserialize = "auth"))]
     LOG_AUTH = 4 << 3,
+    #[serde(rename(deserialize = "syslog"))]
     LOG_SYSLOG = 5 << 3,
 }
 
 type StructuredData = HashMap<String, HashMap<String, String>>;
 
-fn format_5424_structured_data(data: StructuredData) -> String {
+fn random_structured_data(
+    max_map_size: usize,
+    max_children: usize,
+    field_len: usize,
+) -> StructuredData {
+    let amount = thread_rng().gen_range(0, max_children);
+
+    random_maps(max_map_size, field_len)
+        .filter(|m| !m.is_empty()) //syslog_rfc5424 ignores empty maps, tested separately
+        .take(amount)
+        .enumerate()
+        .map(|(i, map)| (format!("id{}", i), map))
+        .collect()
+}
+
+fn format_structured_data_rfc5424(data: &StructuredData) -> String {
     if data.is_empty() {
         "-".to_string()
     } else {
         let mut res = String::new();
-        for (id, params) in &data {
+        for (id, params) in data {
             res = res + "[" + id;
             for (name, value) in params {
                 res = res + " " + name + "=\"" + value + "\"";
@@ -235,4 +335,11 @@ fn format_5424_structured_data(data: StructuredData) -> String {
 
 fn encode_priority(severity: Severity, facility: Facility) -> u8 {
     facility as u8 | severity as u8
+}
+
+fn tcp_json_sink(address: String) -> SocketSinkConfig {
+    SocketSinkConfig::new(
+        socket::Mode::Tcp(TcpSinkConfig::new(address, None, None)),
+        EncodingConfig::from(Encoding::Json),
+    )
 }

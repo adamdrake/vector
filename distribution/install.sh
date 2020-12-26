@@ -11,14 +11,15 @@
 set -u
 
 # If PACKAGE_ROOT is unset or empty, default it.
-PACKAGE_ROOT="${PACKAGE_ROOT:-https://packages.timber.io/vector}"
+PACKAGE_ROOT="${PACKAGE_ROOT:-"https://packages.timber.io/vector"}"
+VECTOR_VERSION="0.11.1"
 _divider="--------------------------------------------------------------------------------"
 _prompt=">>>"
 _indent="   "
 
 header() {
     cat 1>&2 <<EOF
-                                   __   __  __  
+                                   __   __  __
                                    \ \ / / / /
                                     \ V / / /
                                      \_/  \/
@@ -29,8 +30,8 @@ header() {
 
 $_divider
 Website: https://vector.dev
-Docs: https://docs.vector.dev
-Community: https://vector.dev/community
+Docs: https://vector.dev/docs/
+Community: https://vector.dev/community/
 $_divider
 
 EOF
@@ -46,6 +47,7 @@ USAGE:
 
 FLAGS:
     -y                      Disable confirmation prompt.
+        --no-modify-path    Don't configure the PATH environment variable
     -h, --help              Prints help information
 EOF
 }
@@ -54,14 +56,16 @@ main() {
     downloader --check
     header
 
-    local _package_manager=$(get_package_manager)
-
     local prompt=yes
+    local modify_path=yes
     for arg in "$@"; do
         case "$arg" in
             -h|--help)
                 usage
                 exit 0
+                ;;
+            --no-modify-path)
+                modify_path=no
                 ;;
             -y)
                 prompt=no
@@ -73,63 +77,34 @@ main() {
 
     # Confirm with the user before proceeding to install Vector through a
     # package manager. Otherwise, we install from an archive.
-    if [ "$prompt" = "yes" ] && [ -n "$_package_manager" ]; then
-        echo "$_prompt How would you like to install vector?"
-        echo ""
-        echo "$_indent 1) Through the $_package_manager package manger (recommended)"
-        echo "$_indent 2) Directly from a pre-built archive"
+    if [ "$prompt" = "yes" ]; then
+        echo "$_prompt We'll be installing Vector via a pre-built archive at https://packages.timber.io/vector/latest/"
+        echo "$_prompt Ready to proceed? (y/n)"
         echo ""
 
         while true; do
-            read -p "$_prompt " _choice </dev/tty
+            read -rp "$_prompt " _choice </dev/tty
             case $_choice in
-                1)
-                    break
+                n)
+                    err "exiting"
                     ;;
-                2)
-                    _package_manager=""
+                y)
                     break
                     ;;
                 *)
-                    echo "Please enter 1 or 2."
+                    echo "Please enter y or n."
                     ;;
             esac
         done
-    fi
 
-    # Print a divider to separate the Vector installer output and the
-    # package manager installer output.
-    if [ -n "$_package_manager" ]; then
+        # Print a divider to separate the Vector installer output and the
+        # package manager installer output.
         echo ""
         echo "$_divider"
         echo ""
     fi
 
-    case "$_package_manager" in
-        apt)
-            apt-get install -y vector
-            ;;
-        yum)
-            yum install -y vector
-            ;;
-        homebrew)
-            brew tap timberio/brew
-            brew install vector
-            ;;
-        *)
-            install_from_archive
-            ;;
-    esac
-}
-
-get_package_manager() {
-    if check_cmd "apt-get"; then
-        echo "apt"
-    elif check_cmd "yum"; then
-        echo "yum"
-    elif check_cmd "brew"; then
-        echo "homebrew"
-    fi
+    install_from_archive $modify_path
 }
 
 install_from_archive() {
@@ -138,8 +113,13 @@ install_from_archive() {
     need_cmd mkdir
     need_cmd rm
     need_cmd rmdir
+    need_cmd grep
+    need_cmd tar
+    need_cmd head
+    need_cmd sed
 
     get_architecture || return 1
+    local modify_path="$1"
     local _arch="$RETVAL"
     assert_nz "$_arch" "arch"
 
@@ -148,43 +128,58 @@ install_from_archive() {
         x86_64-apple-darwin)
             _archive_arch=$_arch
             ;;
-        x86_64-*linux*)
+        x86_64-*linux*-gnu)
+            _archive_arch="x86_64-unknown-linux-gnu"
+            ;;
+        x86_64-*linux*-musl)
             _archive_arch="x86_64-unknown-linux-musl"
+            ;;
+        aarch64-*linux*)
+            _archive_arch="aarch64-unknown-linux-musl"
+            ;;
+	armv7-*linux*-gnu)
+            _archive_arch="armv7-unknown-linux-gnueabihf"
+            ;;
+	armv7-*linux*-musl)
+            _archive_arch="armv7-unknown-linux-musleabihf"
             ;;
         *)
             err "unsupported arch: $_arch"
             ;;
     esac
 
-    local _url="${PACKAGE_ROOT}/latest/vector-latest-${_archive_arch}.tar.gz"
+    local _url="${PACKAGE_ROOT}/latest/vector-${VECTOR_VERSION}-${_archive_arch}.tar.gz"
 
     local _dir
     _dir="$(mktemp -d 2>/dev/null || ensure mktemp -d -t vector-install)"
 
-    local _file="${_dir}/vector-latest-${_archive_arch}.tar.gz"
+    local _file="${_dir}/vector-${VECTOR_VERSION}-${_archive_arch}.tar.gz"
 
     ensure mkdir -p "$_dir"
 
-    printf "$_prompt Downloading Vector..."
+    printf "%s Downloading Vector via %s" "$_prompt" "$_url"
     ensure downloader "$_url" "$_file"
     printf " ✓\n"
 
-    printf "$_prompt Unpacking archive to $HOME/.vector ..."
+    printf "%s Unpacking archive to $HOME/.vector ..." "$_prompt"
     ensure mkdir -p "$HOME/.vector"
-    ensure tar -xzf "$_file" --directory="$HOME/.vector" --strip-components=1
+    ensure tar -xzf "$_file" --directory="$HOME/.vector" --strip-components=2
+
     printf " ✓\n"
 
-    printf "$_prompt Adding Vector path to ~/.profile"
-    echo 'export PATH="$HOME/.vector/bin:$PATH"' >> $HOME/.profile
-    echo 'export PATH="$HOME/.vector/bin:$PATH"' >> $HOME/.zprofile
-    printf " ✓\n"
+    if [ "$modify_path" = "yes" ]; then
+      local _path="export PATH=\"\$HOME/.vector/bin:\$PATH\""
+      add_to_path "${HOME}/.zprofile" "${_path}"
+      add_to_path "${HOME}/.profile" "${_path}"
+      printf " ✓\n"
+    fi
 
-    printf "$_prompt Install succeeded! 🚀\n"
-    printf "$_prompt To start Vector:\n"
+    printf "%s Install succeeded! 🚀\n" "$_prompt"
+    printf "%s To start Vector:\n" "$_prompt"
     printf "\n"
-    printf "$_indent vector --config ~/.vector/vector.toml\n"
+    printf "%s vector --config ~/.vector/vector.toml\n" "$_indent"
     printf "\n"
-    printf "$_prompt More information at https://docs.vector.dev\n"
+    printf "%s More information at https://vector.dev/docs/\n" "$_prompt"
 
     local _retval=$?
 
@@ -194,10 +189,47 @@ install_from_archive() {
     return "$_retval"
 }
 
+add_to_path() {
+  local file="$1"
+  local new_path="$2"
+
+  printf "%s Adding Vector path to ${file}" "$_prompt"
+
+  if [ ! -f "$file" ]; then
+    echo "${new_path}" >> "${file}"
+  else
+    grep -qxF "${new_path}" "${file}" || echo "${new_path}" >> "${file}"
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # All code below here was copied from https://sh.rustup.rs and can safely
 # be updated if necessary.
 # ------------------------------------------------------------------------------
+
+get_gnu_musl_glibc() {
+  need_cmd ldd
+  need_cmd bc
+  need_cmd awk
+  # Detect both gnu and musl
+  # Also detect glibc versions older than 2.18 and return musl for these
+  # Required until we address https://github.com/timberio/vector/issues/5412.
+  local _ldd_version
+  local _glibc_version
+  _ldd_version=$(ldd --version)
+  if [[ $_ldd_version =~ "GNU" ]]; then
+    _glibc_version=$(echo "$_ldd_version" | awk '/ldd/{print $NF}')
+    if [ 1 -eq "$(echo "${_glibc_version} < 2.18" | bc)" ]; then
+      echo "musl"
+    else
+      echo "gnu"
+    fi
+elif [[ $_ldd_version =~ "musl" ]]; then
+  echo "musl"
+else
+  err "Unknown architecture from ldd: ${_ldd_version}"
+fi
+}
 
 get_bitness() {
     need_cmd head
@@ -263,7 +295,18 @@ get_architecture() {
             ;;
 
         Linux)
-            _ostype=unknown-linux-gnu
+            case $(get_gnu_musl_glibc) in
+              "musl")
+                _ostype=unknown-linux-musl
+                ;;
+              "gnu")
+                _ostype=unknown-linux-gnu
+                ;;
+              # Fallback
+              *)
+                _ostype=unknown-linux-gnu
+                ;;
+            esac
             _bitness=$(get_bitness)
             ;;
 
@@ -377,6 +420,14 @@ get_architecture() {
             powerpc64)
                 _cputype=powerpc
                 ;;
+            aarch64)
+                _cputype=armv7
+                if [ "$_ostype" = "linux-android" ]; then
+                    _ostype=linux-androideabi
+                else
+                    _ostype="${_ostype}eabihf"
+                fi
+                ;;
         esac
     fi
 
@@ -402,7 +453,6 @@ err() {
 
 need_cmd() {
     if ! check_cmd "$1"; then
-
         err "need '$1' (command not found)"
     fi
 }
@@ -419,7 +469,8 @@ assert_nz() {
 # will immediately terminate with an error showing the failing
 # command.
 ensure() {
-    local output="$($@ 2>&1 > /dev/null)"
+    local output
+    output="$("$@" 2>&1 > /dev/null)"
 
     if [ "$output" ]; then
         echo ""

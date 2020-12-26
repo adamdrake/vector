@@ -1,15 +1,15 @@
 use crate::{
-    event::{self, Event},
-    topology::config::{DataType, GlobalOptions, SourceConfig},
+    config::{log_schema, DataType, GlobalOptions, Resource, SourceConfig, SourceDescription},
+    event::Event,
+    internal_events::{StdinEventReceived, StdinReadFailed},
+    shutdown::ShutdownSignal,
+    Pipeline,
 };
 use bytes::Bytes;
-use codec::BytesDelimitedCodec;
-use futures::{future, sync::mpsc, Future, Sink, Stream};
+use futures::{executor, FutureExt, SinkExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    codec::FramedRead,
-    io::{stdin, AsyncRead},
-};
+use std::{io, thread};
+use tokio::sync::mpsc::channel;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]
@@ -32,52 +32,99 @@ fn default_max_length() -> usize {
     bytesize::kib(100u64) as usize
 }
 
+inventory::submit! {
+    SourceDescription::new::<StdinConfig>("stdin")
+}
+
+impl_generate_config_from_default!(StdinConfig);
+
+#[async_trait::async_trait]
 #[typetag::serde(name = "stdin")]
 impl SourceConfig for StdinConfig {
-    fn build(
+    async fn build(
         &self,
         _name: &str,
         _globals: &GlobalOptions,
-        out: mpsc::Sender<Event>,
-    ) -> Result<super::Source, String> {
-        Ok(stdin_source(stdin(), self.clone(), out))
+        shutdown: ShutdownSignal,
+        out: Pipeline,
+    ) -> crate::Result<super::Source> {
+        stdin_source(io::BufReader::new(io::stdin()), self.clone(), shutdown, out)
     }
 
     fn output_type(&self) -> DataType {
         DataType::Log
     }
+
+    fn source_type(&self) -> &'static str {
+        "stdin"
+    }
+
+    fn resources(&self) -> Vec<Resource> {
+        vec![Resource::Stdin]
+    }
 }
 
-pub fn stdin_source<S>(stream: S, config: StdinConfig, out: mpsc::Sender<Event>) -> super::Source
+pub fn stdin_source<R>(
+    stdin: R,
+    config: StdinConfig,
+    shutdown: ShutdownSignal,
+    out: Pipeline,
+) -> crate::Result<super::Source>
 where
-    S: AsyncRead + Send + 'static,
+    R: Send + io::BufRead + 'static,
 {
-    Box::new(future::lazy(move || {
-        info!("Capturing STDIN");
+    let host_key = config
+        .host_key
+        .unwrap_or_else(|| log_schema().host_key().to_string());
+    let hostname = crate::get_hostname().ok();
 
-        let host_key = config.host_key.clone().unwrap_or(event::HOST.to_string());
-        let hostname = hostname::get_hostname();
+    let (mut sender, receiver) = channel(1024);
 
-        let source = FramedRead::new(
-            stream,
-            BytesDelimitedCodec::new_with_max_length(b'\n', config.max_length),
-        )
-        .map(move |line| create_event(line, &host_key, &hostname))
-        .map_err(|e| error!("error reading line: {:?}", e))
-        .forward(out.sink_map_err(|e| error!("Error sending in sink {}", e)))
-        .map(|_| info!("finished sending"));
+    // Start the background thread
+    thread::spawn(move || {
+        info!("Capturing STDIN.");
 
-        source
+        for line in stdin.lines() {
+            if executor::block_on(sender.send(line)).is_err() {
+                // receiver has closed so we should shutdown
+                return;
+            }
+        }
+    });
+
+    Ok(Box::pin(async move {
+        let mut out =
+            out.sink_map_err(|error| error!(message = "Unable to send event to out.", %error));
+
+        let res = receiver
+            .take_until(shutdown)
+            .map_err(|error| emit!(StdinReadFailed { error }))
+            .map_ok(move |line| {
+                emit!(StdinEventReceived {
+                    byte_size: line.len()
+                });
+                create_event(Bytes::from(line), &host_key, &hostname)
+            })
+            .forward(&mut out)
+            .inspect(|_| info!("Finished sending."))
+            .await;
+
+        let _ = out.flush().await; // error emitted by sink_map_err
+
+        res
     }))
 }
 
-fn create_event(line: Bytes, host_key: &String, hostname: &Option<String>) -> Event {
+fn create_event(line: Bytes, host_key: &str, hostname: &Option<String>) -> Event {
     let mut event = Event::from(line);
 
+    // Add source type
+    event
+        .as_mut_log()
+        .insert(log_schema().source_type_key(), Bytes::from("stdin"));
+
     if let Some(hostname) = &hostname {
-        event
-            .as_mut_log()
-            .insert_implicit(host_key.clone().into(), hostname.clone().into());
+        event.as_mut_log().insert(host_key, hostname.clone());
     }
 
     event
@@ -86,11 +133,14 @@ fn create_event(line: Bytes, host_key: &String, hostname: &Option<String>) -> Ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event;
-    use futures::sync::mpsc;
-    use futures::Async::*;
+    use crate::{test_util::trace_init, Pipeline};
     use std::io::Cursor;
-    use tokio::runtime::current_thread::Runtime;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<StdinConfig>();
+    }
 
     #[test]
     fn stdin_create_event() {
@@ -101,38 +151,41 @@ mod tests {
         let event = create_event(line, &host_key, &hostname);
         let log = event.into_log();
 
-        assert_eq!(log[&"host".into()], "Some.Machine".into());
-        assert_eq!(log[&event::MESSAGE], "hello world".into());
+        assert_eq!(log["host"], "Some.Machine".into());
+        assert_eq!(log[log_schema().message_key()], "hello world".into());
+        assert_eq!(log[log_schema().source_type_key()], "stdin".into());
     }
 
-    #[test]
-    fn stdin_decodes_line() {
-        let (tx, mut rx) = mpsc::channel(10);
+    #[tokio::test]
+    async fn stdin_decodes_line() {
+        trace_init();
+
+        let (tx, mut rx) = Pipeline::new_test();
         let config = StdinConfig::default();
-        let buf = Cursor::new(String::from("hello world\nhello world again"));
+        let buf = Cursor::new("hello world\nhello world again");
 
-        let mut rt = Runtime::new().unwrap();
-        let source = stdin_source(buf, config, tx);
+        stdin_source(buf, config, ShutdownSignal::noop(), tx)
+            .unwrap()
+            .await
+            .unwrap();
 
-        rt.block_on(source).unwrap();
+        let event = rx.try_recv();
 
-        let event = rx.poll().unwrap();
-
-        assert!(event.is_ready());
+        assert!(event.is_ok());
         assert_eq!(
-            Ready(Some("hello world".into())),
-            event.map(|event| event.map(|event| event.as_log()[&event::MESSAGE].to_string_lossy()))
+            Ok("hello world".into()),
+            event.map(|event| event.as_log()[log_schema().message_key()].to_string_lossy())
         );
 
-        let event = rx.poll().unwrap();
-        assert!(event.is_ready());
+        let event = rx.try_recv();
+        assert!(event.is_ok());
         assert_eq!(
-            Ready(Some("hello world again".into())),
-            event.map(|event| event.map(|event| event.as_log()[&event::MESSAGE].to_string_lossy()))
+            Ok("hello world again".into()),
+            event.map(|event| event.as_log()[log_schema().message_key()].to_string_lossy())
         );
 
-        let event = rx.poll().unwrap();
-        assert!(event.is_ready());
-        assert_eq!(Ready(None), event);
+        let event = rx.try_recv();
+        assert!(event.is_err());
+        assert_eq!(Err(mpsc::error::TryRecvError::Closed), event);
     }
 }

@@ -1,241 +1,418 @@
 use crate::{
-    buffers::Acker,
-    event::{self, Event, ValueKind},
+    config::{log_schema, DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
+    event::{Event, LogEvent, Value},
+    http::HttpClient,
+    internal_events::{SplunkEventEncodeError, SplunkEventSent, SplunkMissingKeys},
     sinks::util::{
-        http::{HttpRetryLogic, HttpService},
-        retries::FixedRetryPolicy,
-        BatchServiceSink, Buffer, Compression, SinkExt,
+        encoding::{EncodingConfig, EncodingConfiguration},
+        http::{BatchedHttpSink, HttpSink},
+        BatchConfig, BatchSettings, Buffer, Compression, Concurrency, TowerRequestConfig,
     },
-    topology::config::{DataType, SinkConfig},
+    template::Template,
+    tls::{TlsOptions, TlsSettings},
 };
-use bytes::Bytes;
-use futures::{Future, Sink};
-use http::{HttpTryFrom, Method, Request, StatusCode, Uri};
-use hyper::{Body, Client};
-use hyper_tls::HttpsConnector;
+use futures::{FutureExt, SinkExt};
+use http::{Request, StatusCode, Uri};
+use hyper::Body;
+use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Duration;
-use string_cache::DefaultAtom as Atom;
-use tower::ServiceBuilder;
+use snafu::{ResultExt, Snafu};
+use std::convert::TryFrom;
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
-#[serde(deny_unknown_fields)]
-pub struct HecSinkConfig {
-    pub token: String,
-    pub host: String,
-    #[serde(default = "default_host_field")]
-    pub host_field: Atom,
-    pub batch_size: Option<usize>,
-    pub batch_timeout: Option<u64>,
-    pub compression: Option<Compression>,
-    pub encoding: Option<Encoding>,
-
-    // Tower Request based configuration
-    pub request_in_flight_limit: Option<usize>,
-    pub request_timeout_secs: Option<u64>,
-    pub request_rate_limit_duration_secs: Option<u64>,
-    pub request_rate_limit_num: Option<u64>,
-    pub request_retry_attempts: Option<usize>,
-    pub request_retry_backoff_secs: Option<u64>,
+#[derive(Debug, Snafu)]
+pub enum BuildError {
+    #[snafu(display("Host must include a scheme (https:// or http://)"))]
+    UriMissingScheme,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HecSinkConfig {
+    pub token: String,
+    // Deprecated name
+    #[serde(alias = "host")]
+    pub endpoint: String,
+    #[serde(default = "default_host_key")]
+    pub host_key: String,
+    #[serde(default)]
+    pub indexed_fields: Vec<String>,
+    pub index: Option<Template>,
+    pub sourcetype: Option<Template>,
+    pub source: Option<Template>,
+    pub encoding: EncodingConfig<Encoding>,
+    #[serde(default)]
+    pub compression: Compression,
+    #[serde(default)]
+    pub batch: BatchConfig,
+    #[serde(default)]
+    pub request: TowerRequestConfig,
+    pub tls: Option<TlsOptions>,
+}
+
+lazy_static! {
+    static ref REQUEST_DEFAULTS: TowerRequestConfig = TowerRequestConfig {
+        concurrency: Concurrency::Fixed(10),
+        rate_limit_num: Some(10),
+        ..Default::default()
+    };
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Derivative)]
 #[serde(rename_all = "snake_case")]
 pub enum Encoding {
     Text,
     Json,
 }
 
-fn default_host_field() -> Atom {
-    event::HOST.clone()
+fn default_host_key() -> String {
+    crate::config::LogSchema::default().host_key().to_string()
 }
 
+inventory::submit! {
+    SinkDescription::new::<HecSinkConfig>("splunk_hec")
+}
+
+impl GenerateConfig for HecSinkConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(Self {
+            token: "${VECTOR_SPLUNK_HEC_TOKEN}".to_owned(),
+            endpoint: "endpoint".to_owned(),
+            host_key: default_host_key(),
+            indexed_fields: vec![],
+            index: None,
+            sourcetype: None,
+            source: None,
+            encoding: Encoding::Text.into(),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+        })
+        .unwrap()
+    }
+}
+
+#[async_trait::async_trait]
 #[typetag::serde(name = "splunk_hec")]
 impl SinkConfig for HecSinkConfig {
-    fn build(&self, acker: Acker) -> Result<(super::RouterSink, super::Healthcheck), String> {
-        validate_host(&self.host)?;
-        let sink = hec(self.clone(), acker)?;
-        let healthcheck = healthcheck(self.token.clone(), self.host.clone())?;
+    async fn build(
+        &self,
+        cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
+        validate_host(&self.endpoint)?;
 
-        Ok((sink, healthcheck))
+        let batch = BatchSettings::default()
+            .bytes(bytesize::mib(1u64))
+            .timeout(1)
+            .parse_config(self.batch)?;
+        let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+        let tls_settings = TlsSettings::from_options(&self.tls)?;
+        let client = HttpClient::new(tls_settings)?;
+
+        let sink = BatchedHttpSink::new(
+            self.clone(),
+            Buffer::new(batch.size, self.compression),
+            request,
+            batch.timeout,
+            client.clone(),
+            cx.acker(),
+        )
+        .sink_map_err(|error| error!(message = "Fatal splunk_hec sink error.", %error));
+
+        let healthcheck = healthcheck(self.clone(), client).boxed();
+
+        Ok((super::VectorSink::Sink(Box::new(sink)), healthcheck))
     }
 
     fn input_type(&self) -> DataType {
         DataType::Log
     }
+
+    fn sink_type(&self) -> &'static str {
+        "splunk_hec"
+    }
 }
 
-pub fn hec(config: HecSinkConfig, acker: Acker) -> Result<super::RouterSink, String> {
-    let host = config.host.clone();
-    let token = config.token.clone();
-    let host_field = config.host_field;
+#[async_trait::async_trait]
+impl HttpSink for HecSinkConfig {
+    type Input = Vec<u8>;
+    type Output = Vec<u8>;
 
-    let batch_size = config.batch_size.unwrap_or(bytesize::mib(1u64) as usize);
-    let gzip = match config.compression.unwrap_or(Compression::None) {
-        Compression::None => false,
-        Compression::Gzip => true,
-    };
-    let batch_timeout = config.batch_timeout.unwrap_or(1);
+    fn encode_event(&self, event: Event) -> Option<Self::Input> {
+        let sourcetype = self.sourcetype.as_ref().and_then(|sourcetype| {
+            sourcetype
+                .render_string(&event)
+                .map_err(|missing_keys| {
+                    emit!(SplunkMissingKeys {
+                        field: "sourcetype",
+                        keys: &missing_keys
+                    });
+                })
+                .ok()
+        });
 
-    let timeout = config.request_timeout_secs.unwrap_or(60);
-    let in_flight_limit = config.request_in_flight_limit.unwrap_or(10);
-    let rate_limit_duration = config.request_rate_limit_duration_secs.unwrap_or(1);
-    let rate_limit_num = config.request_rate_limit_num.unwrap_or(10);
-    let retry_attempts = config.request_retry_attempts.unwrap_or(usize::max_value());
-    let retry_backoff_secs = config.request_retry_backoff_secs.unwrap_or(1);
-    let encoding = config.encoding.clone();
+        let source = self.source.as_ref().and_then(|source| {
+            source
+                .render_string(&event)
+                .map_err(|missing_keys| {
+                    emit!(SplunkMissingKeys {
+                        field: "source",
+                        keys: &missing_keys
+                    });
+                })
+                .ok()
+        });
 
-    let policy = FixedRetryPolicy::new(
-        retry_attempts,
-        Duration::from_secs(retry_backoff_secs),
-        HttpRetryLogic,
-    );
+        let index = self.index.as_ref().and_then(|index| {
+            index
+                .render_string(&event)
+                .map_err(|missing_keys| {
+                    emit!(SplunkMissingKeys {
+                        field: "index",
+                        keys: &missing_keys
+                    });
+                })
+                .ok()
+        });
 
-    let uri = format!("{}/services/collector/event", host)
-        .parse::<Uri>()
-        .map_err(|e| format!("{}", e))?;
-    let token = Bytes::from(format!("Splunk {}", token));
+        let mut event = event.into_log();
 
-    let http_service = HttpService::new(move |body: Vec<u8>| {
-        let mut builder = Request::builder();
-        builder.method(Method::POST);
-        builder.uri(uri.clone());
+        let host = event.get(self.host_key.to_owned()).cloned();
 
-        builder.header("Content-Type", "application/json");
+        let timestamp = match event.remove(log_schema().timestamp_key()) {
+            Some(Value::Timestamp(ts)) => ts,
+            _ => chrono::Utc::now(),
+        };
+        let timestamp = (timestamp.timestamp_millis() as f64) / 1000f64;
 
-        if gzip {
-            builder.header("Content-Encoding", "gzip");
+        let fields = self
+            .indexed_fields
+            .iter()
+            .filter_map(|field| event.get(field).map(|value| (field, value.clone())))
+            .collect::<LogEvent>();
+
+        let mut event = Event::Log(event);
+        self.encoding.apply_rules(&mut event);
+        let event = event.into_log();
+
+        let event = match self.encoding.codec() {
+            Encoding::Json => json!(event),
+            Encoding::Text => json!(event
+                .get(log_schema().message_key())
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into())),
+        };
+
+        let mut body = json!({
+            "event": event,
+            "fields": fields,
+            "time": timestamp
+        });
+
+        if let Some(host) = host {
+            let host = host.to_string_lossy();
+            body["host"] = json!(host);
         }
 
-        builder.header("Authorization", token.clone());
+        if let Some(index) = index {
+            body["index"] = json!(index);
+        }
 
-        builder.body(body).unwrap()
-    });
+        if let Some(source) = source {
+            body["source"] = json!(source);
+        }
 
-    let service = ServiceBuilder::new()
-        .concurrency_limit(in_flight_limit)
-        .rate_limit(rate_limit_num, Duration::from_secs(rate_limit_duration))
-        .retry(policy)
-        .timeout(Duration::from_secs(timeout))
-        .service(http_service);
+        if let Some(sourcetype) = &sourcetype {
+            body["sourcetype"] = json!(sourcetype);
+        }
 
-    let sink = BatchServiceSink::new(service, acker)
-        .batched_with_min(
-            Buffer::new(gzip),
-            batch_size,
-            Duration::from_secs(batch_timeout),
-        )
-        .with(move |e| encode_event(&host_field, e, &encoding));
+        match serde_json::to_vec(&body) {
+            Ok(value) => {
+                emit!(SplunkEventSent {
+                    byte_size: value.len()
+                });
+                Some(value)
+            }
+            Err(error) => {
+                emit!(SplunkEventEncodeError { error });
+                None
+            }
+        }
+    }
 
-    Ok(Box::new(sink))
+    async fn build_request(&self, events: Self::Output) -> crate::Result<Request<Vec<u8>>> {
+        let uri =
+            build_uri(&self.endpoint, "/services/collector/event").expect("Unable to parse URI");
+
+        let mut builder = Request::post(uri)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Splunk {}", self.token));
+
+        if let Some(ce) = self.compression.content_encoding() {
+            builder = builder.header("Content-Encoding", ce);
+        }
+
+        builder.body(events).map_err(Into::into)
+    }
 }
 
-pub fn healthcheck(token: String, host: String) -> Result<super::Healthcheck, String> {
-    let uri = format!("{}/services/collector/health/1.0", host)
-        .parse::<Uri>()
-        .map_err(|e| format!("{}", e))?;
+#[derive(Debug, Snafu)]
+enum HealthcheckError {
+    #[snafu(display("Invalid HEC token"))]
+    InvalidToken,
+    #[snafu(display("Queues are full"))]
+    QueuesFull,
+}
+
+pub async fn healthcheck(config: HecSinkConfig, client: HttpClient) -> crate::Result<()> {
+    let uri = build_uri(&config.endpoint, "/services/collector/health/1.0")
+        .context(super::UriParseError)?;
 
     let request = Request::get(uri)
-        .header("Authorization", format!("Splunk {}", token))
+        .header("Authorization", format!("Splunk {}", config.token))
         .body(Body::empty())
         .unwrap();
 
-    let https = HttpsConnector::new(4).expect("TLS initialization failed");
-    let client = Client::builder().build(https);
-
-    let healthcheck = client
-        .request(request)
-        .map_err(|err| err.to_string())
-        .and_then(|response| match response.status() {
-            StatusCode::OK => Ok(()),
-            StatusCode::BAD_REQUEST => Err("Invalid HEC token".to_string()),
-            StatusCode::SERVICE_UNAVAILABLE => Err("HEC is unhealthy, queues are full".to_string()),
-            other => Err(format!("Unexpected status: {}", other)),
-        });
-
-    Ok(Box::new(healthcheck))
-}
-
-pub fn validate_host(host: &String) -> Result<(), String> {
-    let uri = Uri::try_from(host).map_err(|e| format!("{}", e))?;
-
-    if let None = uri.scheme_part() {
-        Err("Host must include a scheme (https or http)".into())
-    } else {
-        Ok(())
+    let response = client.send(request).await?;
+    match response.status() {
+        StatusCode::OK => Ok(()),
+        StatusCode::BAD_REQUEST => Err(HealthcheckError::InvalidToken.into()),
+        StatusCode::SERVICE_UNAVAILABLE => Err(HealthcheckError::QueuesFull.into()),
+        other => Err(super::HealthcheckError::UnexpectedStatus { status: other }.into()),
     }
 }
 
-fn encode_event(
-    host_field: &Atom,
-    event: Event,
-    encoding: &Option<Encoding>,
-) -> Result<Vec<u8>, ()> {
-    let mut event = event.into_log();
+pub fn validate_host(host: &str) -> crate::Result<()> {
+    let uri = Uri::try_from(host).context(super::UriParseError)?;
 
-    let host = event.get(&host_field).map(|h| h.clone());
-    let timestamp = if let Some(ValueKind::Timestamp(ts)) = event.remove(&event::TIMESTAMP) {
-        ts.timestamp()
-    } else {
-        chrono::Utc::now().timestamp()
-    };
-
-    let mut body = match (encoding, event.is_structured()) {
-        (&Some(Encoding::Json), _) | (_, true) => json!({
-            "fields": event.explicit_fields(),
-            "event": event.unflatten(),
-            "time": timestamp,
-        }),
-        (&Some(Encoding::Text), _) | (_, false) => json!({
-            "event": event.get(&event::MESSAGE).map(|v| v.to_string_lossy()).unwrap_or_else(|| "".into()),
-            "time": timestamp,
-        }),
-    };
-
-    if let Some(host) = host {
-        let host = host.to_string_lossy();
-        body["host"] = json!(host);
+    match uri.scheme() {
+        Some(_) => Ok(()),
+        None => Err(Box::new(BuildError::UriMissingScheme)),
     }
+}
 
-    serde_json::to_vec(&body).map_err(|e| panic!("Error encoding json body: {}", e))
+fn build_uri(host: &str, path: &str) -> Result<Uri, http::uri::InvalidUri> {
+    format!("{}{}", host.trim_end_matches('/'), path).parse::<Uri>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{self, Event};
+    use crate::event::Event;
+    use crate::sinks::util::{http::HttpSink, test::load_sink};
+    use chrono::Utc;
     use serde::Deserialize;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<HecSinkConfig>();
+    }
 
     #[derive(Deserialize, Debug)]
-    struct HecEvent {
-        time: i64,
-        event: HashMap<String, String>,
-        fields: HashMap<String, String>,
+    struct HecEventJson {
+        time: f64,
+        event: BTreeMap<String, String>,
+        fields: BTreeMap<String, String>,
+        source: Option<String>,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct HecEventText {
+        time: f64,
+        event: String,
+        fields: BTreeMap<String, String>,
     }
 
     #[test]
-    fn splunk_encode_event_structured() {
-        let host = "host".into();
+    fn splunk_encode_event_json() {
         let mut event = Event::from("hello world");
-        event
-            .as_mut_log()
-            .insert_explicit("key".into(), "value".into());
+        event.as_mut_log().insert("key", "value");
+        event.as_mut_log().insert("magic", "vector");
 
-        let bytes = encode_event(&host, event, &None).unwrap();
+        let (config, _cx) = load_sink::<HecSinkConfig>(
+            r#"
+            host = "test.com"
+            token = "alksjdfo"
+            host_key = "host"
+            indexed_fields = ["key"]
+            source = "{{ magic }}"
 
-        let hec_event = serde_json::from_slice::<HecEvent>(&bytes[..]).unwrap();
+            [encoding]
+            codec = "json"
+            except_fields = ["magic"]
+        "#,
+        )
+        .unwrap();
+
+        let bytes = config.encode_event(event).unwrap();
+
+        let hec_event = serde_json::from_slice::<HecEventJson>(&bytes[..]).unwrap();
 
         let event = &hec_event.event;
-        let kv = event.get("key".into()).unwrap();
+        let kv = event.get(&"key".to_string()).unwrap();
 
         assert_eq!(kv, &"value".to_string());
         assert_eq!(
-            event[&event::MESSAGE.to_string()],
+            event[&log_schema().message_key().to_string()],
             "hello world".to_string()
         );
-        assert!(event.get(&event::TIMESTAMP.to_string()).is_none());
+        assert!(event
+            .get(&log_schema().timestamp_key().to_string())
+            .is_none());
+
+        assert!(!event.contains_key("magic"));
+        assert_eq!(hec_event.source, Some("vector".to_string()));
+
+        assert_eq!(
+            hec_event.fields.get("key").map(|s| s.as_str()),
+            Some("value")
+        );
+
+        let now = Utc::now().timestamp_millis() as f64 / 1000f64;
+        assert!(
+            (hec_event.time - now).abs() < 0.2,
+            format!("hec_event.time = {}, now = {}", hec_event.time, now)
+        );
+        assert_eq!((hec_event.time * 1000f64).fract(), 0f64);
+    }
+
+    #[test]
+    fn splunk_encode_event_text() {
+        let mut event = Event::from("hello world");
+        event.as_mut_log().insert("key", "value");
+
+        let (config, _cx) = load_sink::<HecSinkConfig>(
+            r#"
+            host = "test.com"
+            token = "alksjdfo"
+            host_key = "host"
+            indexed_fields = ["key"]
+
+            [encoding]
+            codec = "text"
+        "#,
+        )
+        .unwrap();
+
+        let bytes = config.encode_event(event).unwrap();
+
+        let hec_event = serde_json::from_slice::<HecEventText>(&bytes[..]).unwrap();
+
+        assert_eq!(hec_event.event.as_str(), "hello world");
+
+        assert_eq!(
+            hec_event.fields.get("key").map(|s| s.as_str()),
+            Some("value")
+        );
+
+        let now = Utc::now().timestamp_millis() as f64 / 1000f64;
+        assert!(
+            (hec_event.time - now).abs() < 0.2,
+            format!("hec_event.time = {}, now = {}", hec_event.time, now)
+        );
+        assert_eq!((hec_event.time * 1000f64).fract(), 0f64);
     }
 
     #[test]
@@ -244,9 +421,17 @@ mod tests {
         let invalid_scheme = "localhost:8888".to_string();
         let invalid_uri = "iminvalidohnoes".to_string();
 
-        assert_eq!(validate_host(&valid), Ok(()));
+        assert!(validate_host(&valid).is_ok());
         assert!(validate_host(&invalid_scheme).is_err());
         assert!(validate_host(&invalid_uri).is_err());
+    }
+
+    #[test]
+    fn splunk_build_uri() {
+        let uri = build_uri("http://test.com/", "/a");
+
+        assert!(uri.is_ok());
+        assert_eq!(format!("{}", uri.unwrap()), "http://test.com/a");
     }
 }
 
@@ -254,64 +439,125 @@ mod tests {
 #[cfg(feature = "splunk-integration-tests")]
 mod integration_tests {
     use super::*;
-    use crate::buffers::Acker;
+    use crate::test_util::retry_until;
     use crate::{
+        assert_downcast_matches,
+        config::{SinkConfig, SinkContext},
         sinks,
         test_util::{random_lines_with_stream, random_string},
         Event,
     };
-    use futures::Sink;
+    use futures::stream;
     use serde_json::Value as JsonValue;
+    use std::{future::ready, net::SocketAddr};
+    use tokio::time::{delay_for, Duration};
+    use warp::Filter;
 
     const USERNAME: &str = "admin";
     const PASSWORD: &str = "password";
 
-    #[test]
-    fn splunk_insert_message() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    // It usually takes ~1 second for the event to show up in search, so poll until
+    // we see it.
+    async fn find_entry(message: &str) -> serde_json::value::Value {
+        for _ in 0..20usize {
+            match recent_entries(None)
+                .await
+                .into_iter()
+                .find(|entry| entry["_raw"].as_str().unwrap_or("").contains(&message))
+            {
+                Some(value) => return value,
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+        panic!("Didn't find event in Splunk");
+    }
 
-        let sink = sinks::splunk_hec::hec(config(), Acker::Null).unwrap();
+    #[tokio::test]
+    async fn splunk_insert_message() {
+        let cx = SinkContext::new_test();
+
+        let config = config(Encoding::Text, vec![]).await;
+        let (sink, _) = config.build(cx).await.unwrap();
 
         let message = random_string(100);
         let event = Event::from(message.clone());
+        sink.run(stream::once(ready(event))).await.unwrap();
 
-        let pump = sink.send(event);
-
-        rt.block_on(pump).unwrap();
-
-        // It usually takes ~1 second for the event to show up in search, so poll until
-        // we see it.
-        let entry = (0..20)
-            .find_map(|_| {
-                recent_entries()
-                    .into_iter()
-                    .find(|entry| entry["_raw"].as_str().unwrap() == message)
-                    .or_else(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        None
-                    })
-            })
-            .expect("Didn't find event in Splunk");
+        let entry = find_entry(message.as_str()).await;
 
         assert_eq!(message, entry["_raw"].as_str().unwrap());
         assert!(entry.get("message").is_none());
     }
 
-    #[test]
-    fn splunk_insert_many() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn splunk_insert_source() {
+        let cx = SinkContext::new_test();
 
-        let sink = sinks::splunk_hec::hec(config(), Acker::Null).unwrap();
+        let mut config = config(Encoding::Text, vec![]).await;
+        config.source = Template::try_from("/var/log/syslog".to_string()).ok();
+
+        let (sink, _) = config.build(cx).await.unwrap();
+
+        let message = random_string(100);
+        let event = Event::from(message.clone());
+        sink.run(stream::once(ready(event))).await.unwrap();
+
+        let entry = find_entry(message.as_str()).await;
+
+        assert_eq!(entry["source"].as_str(), Some("/var/log/syslog"));
+    }
+
+    #[tokio::test]
+    async fn splunk_insert_index() {
+        let cx = SinkContext::new_test();
+
+        let mut config = config(Encoding::Text, vec![]).await;
+        config.index = Template::try_from("custom_index".to_string()).ok();
+        let (sink, _) = config.build(cx).await.unwrap();
+
+        let message = random_string(100);
+        let event = Event::from(message.clone());
+        sink.run(stream::once(ready(event))).await.unwrap();
+
+        let entry = find_entry(message.as_str()).await;
+
+        assert_eq!(entry["index"].as_str().unwrap(), "custom_index");
+    }
+
+    #[tokio::test]
+    async fn splunk_index_is_interpolated() {
+        let cx = SinkContext::new_test();
+
+        let indexed_fields = vec!["asdf".to_string()];
+        let mut config = config(Encoding::Json, indexed_fields).await;
+        config.index = Template::try_from("{{ index_name }}".to_string()).ok();
+
+        let (sink, _) = config.build(cx).await.unwrap();
+
+        let message = random_string(100);
+        let mut event = Event::from(message.clone());
+        event.as_mut_log().insert("index_name", "custom_index");
+        sink.run(stream::once(ready(event))).await.unwrap();
+
+        let entry = find_entry(message.as_str()).await;
+
+        let index = entry["index"].as_str().unwrap();
+        assert_eq!("custom_index", index);
+    }
+
+    #[tokio::test]
+    async fn splunk_insert_many() {
+        let cx = SinkContext::new_test();
+
+        let config = config(Encoding::Text, vec![]).await;
+        let (sink, _) = config.build(cx).await.unwrap();
 
         let (messages, events) = random_lines_with_stream(100, 10);
-
-        let pump = sink.send_all(events);
-
-        rt.block_on(pump).unwrap();
+        sink.run(events).await.unwrap();
 
         let mut found_all = false;
         for _ in 0..20 {
-            let entries = recent_entries();
+            let entries = recent_entries(None).await;
 
             found_all = messages.iter().all(|message| {
                 entries
@@ -323,75 +569,47 @@ mod integration_tests {
                 break;
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            delay_for(Duration::from_millis(100)).await;
         }
 
         assert!(found_all);
     }
 
-    #[test]
-    fn splunk_custom_fields() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn splunk_custom_fields() {
+        let cx = SinkContext::new_test();
 
-        let sink = sinks::splunk_hec::hec(config(), Acker::Null).unwrap();
+        let indexed_fields = vec!["asdf".into()];
+        let config = config(Encoding::Json, indexed_fields).await;
+        let (sink, _) = config.build(cx).await.unwrap();
 
         let message = random_string(100);
         let mut event = Event::from(message.clone());
-        event
-            .as_mut_log()
-            .insert_explicit("asdf".into(), "hello".into());
+        event.as_mut_log().insert("asdf", "hello");
+        sink.run(stream::once(ready(event))).await.unwrap();
 
-        let pump = sink.send(event);
-
-        rt.block_on(pump).unwrap();
-
-        let entry = (0..20)
-            .find_map(|_| {
-                recent_entries()
-                    .into_iter()
-                    .find(|entry| entry["message"].as_str() == Some(message.as_str()))
-                    .or_else(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        None
-                    })
-            })
-            .expect("Didn't find event in Splunk");
+        let entry = find_entry(message.as_str()).await;
 
         assert_eq!(message, entry["message"].as_str().unwrap());
         let asdf = entry["asdf"].as_array().unwrap()[0].as_str().unwrap();
         assert_eq!("hello", asdf);
     }
 
-    #[test]
-    fn splunk_hostname() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn splunk_hostname() {
+        let cx = SinkContext::new_test();
 
-        let sink = sinks::splunk_hec::hec(config(), Acker::Null).unwrap();
+        let indexed_fields = vec!["asdf".into()];
+        let config = config(Encoding::Json, indexed_fields).await;
+        let (sink, _) = config.build(cx).await.unwrap();
 
         let message = random_string(100);
         let mut event = Event::from(message.clone());
-        event
-            .as_mut_log()
-            .insert_explicit("asdf".into(), "hello".into());
-        event
-            .as_mut_log()
-            .insert_implicit("host".into(), "example.com:1234".into());
+        event.as_mut_log().insert("asdf", "hello");
+        event.as_mut_log().insert("host", "example.com:1234");
+        sink.run(stream::once(ready(event))).await.unwrap();
 
-        let pump = sink.send(event);
-
-        rt.block_on(pump).unwrap();
-
-        let entry = (0..20)
-            .find_map(|_| {
-                recent_entries()
-                    .into_iter()
-                    .find(|entry| entry["message"].as_str() == Some(message.as_str()))
-                    .or_else(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        None
-                    })
-            })
-            .expect("Didn't find event in Splunk");
+        let entry = find_entry(message.as_str()).await;
 
         assert_eq!(message, entry["message"].as_str().unwrap());
         let asdf = entry["asdf"].as_array().unwrap()[0].as_str().unwrap();
@@ -400,44 +618,49 @@ mod integration_tests {
         assert_eq!("example.com:1234", host);
     }
 
-    #[test]
-    fn splunk_configure_hostname() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn splunk_sourcetype() {
+        let cx = SinkContext::new_test();
 
-        let config = super::HecSinkConfig {
-            host_field: "roast".into(),
-            ..config()
-        };
+        let indexed_fields = vec!["asdf".to_string()];
+        let mut config = config(Encoding::Json, indexed_fields).await;
+        config.sourcetype = Template::try_from("_json".to_string()).ok();
 
-        let sink = sinks::splunk_hec::hec(config, Acker::Null).unwrap();
+        let (sink, _) = config.build(cx).await.unwrap();
 
         let message = random_string(100);
         let mut event = Event::from(message.clone());
-        event
-            .as_mut_log()
-            .insert_explicit("asdf".into(), "hello".into());
-        event
-            .as_mut_log()
-            .insert_implicit("host".into(), "example.com:1234".into());
-        event
-            .as_mut_log()
-            .insert_explicit("roast".into(), "beef.example.com:1234".into());
+        event.as_mut_log().insert("asdf", "hello");
+        sink.run(stream::once(ready(event))).await.unwrap();
 
-        let pump = sink.send(event);
+        let entry = find_entry(message.as_str()).await;
 
-        rt.block_on(pump).unwrap();
+        assert_eq!(message, entry["message"].as_str().unwrap());
+        let asdf = entry["asdf"].as_array().unwrap()[0].as_str().unwrap();
+        assert_eq!("hello", asdf);
+        let sourcetype = entry["sourcetype"].as_str().unwrap();
+        assert_eq!("_json", sourcetype);
+    }
 
-        let entry = (0..20)
-            .find_map(|_| {
-                recent_entries()
-                    .into_iter()
-                    .find(|entry| entry["message"].as_str() == Some(message.as_str()))
-                    .or_else(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        None
-                    })
-            })
-            .expect("Didn't find event in Splunk");
+    #[tokio::test]
+    async fn splunk_configure_hostname() {
+        let cx = SinkContext::new_test();
+
+        let config = HecSinkConfig {
+            host_key: "roast".into(),
+            ..config(Encoding::Json, vec!["asdf".to_string()]).await
+        };
+
+        let (sink, _) = config.build(cx).await.unwrap();
+
+        let message = random_string(100);
+        let mut event = Event::from(message.clone());
+        event.as_mut_log().insert("asdf", "hello");
+        event.as_mut_log().insert("host", "example.com:1234");
+        event.as_mut_log().insert("roast", "beef.example.com:1234");
+        sink.run(stream::once(ready(event))).await.unwrap();
+
+        let entry = find_entry(message.as_str()).await;
 
         assert_eq!(message, entry["message"].as_str().unwrap());
         let asdf = entry["asdf"].as_array().unwrap()[0].as_str().unwrap();
@@ -446,25 +669,29 @@ mod integration_tests {
         assert_eq!("beef.example.com:1234", host);
     }
 
-    #[test]
-    fn splunk_healthcheck() {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn splunk_healthcheck() {
+        let config_to_healthcheck = move |config: HecSinkConfig| {
+            let tls_settings = TlsSettings::from_options(&config.tls).unwrap();
+            let client = HttpClient::new(tls_settings).unwrap();
+            sinks::splunk_hec::healthcheck(config, client)
+        };
 
         // OK
         {
-            let healthcheck =
-                sinks::splunk_hec::healthcheck(get_token(), "http://localhost:8088".to_string())
-                    .unwrap();
-            rt.block_on(healthcheck).unwrap();
+            let config = config(Encoding::Text, vec![]).await;
+            let healthcheck = config_to_healthcheck(config);
+            healthcheck.await.unwrap();
         }
 
         // Server not listening at address
         {
-            let healthcheck =
-                sinks::splunk_hec::healthcheck(get_token(), "http://localhost:1111".to_string())
-                    .unwrap();
-
-            rt.block_on(healthcheck).unwrap_err();
+            let config = HecSinkConfig {
+                endpoint: "http://localhost:1111".to_string(),
+                ..config(Encoding::Text, vec![]).await
+            };
+            let healthcheck = config_to_healthcheck(config);
+            healthcheck.await.unwrap_err();
         }
 
         // Invalid token
@@ -482,58 +709,96 @@ mod integration_tests {
 
         // Unhealthy server
         {
-            let healthcheck =
-                sinks::splunk_hec::healthcheck(get_token(), "http://503.returnco.de".to_string())
-                    .unwrap();
-            assert_eq!(
-                rt.block_on(healthcheck).unwrap_err(),
-                "HEC is unhealthy, queues are full"
+            let config = HecSinkConfig {
+                endpoint: "http://localhost:5503".to_string(),
+                ..config(Encoding::Text, vec![]).await
+            };
+
+            let unhealthy = warp::any()
+                .map(|| warp::reply::with_status("i'm sad", StatusCode::SERVICE_UNAVAILABLE));
+            let server = warp::serve(unhealthy).bind("0.0.0.0:5503".parse::<SocketAddr>().unwrap());
+            tokio::spawn(server);
+
+            let healthcheck = config_to_healthcheck(config);
+            assert_downcast_matches!(
+                healthcheck.await.unwrap_err(),
+                HealthcheckError,
+                HealthcheckError::QueuesFull
             );
         }
     }
 
-    fn recent_entries() -> Vec<JsonValue> {
+    async fn recent_entries(index: Option<&str>) -> Vec<JsonValue> {
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap();
 
-        // http://docs.splunk.com/Documentation/Splunk/7.2.1/RESTREF/RESTsearch#search.2Fjobs
-        let mut res = client
+        // https://docs.splunk.com/Documentation/Splunk/7.2.1/RESTREF/RESTsearch#search.2Fjobs
+        let search_query = match index {
+            Some(index) => format!("search index={}", index),
+            None => "search *".into(),
+        };
+        let res = client
             .post("https://localhost:8089/services/search/jobs?output_mode=json")
-            .form(&[("search", "search *"), ("exec_mode", "oneshot"), ("f", "*")])
+            .form(&vec![
+                ("search", &search_query[..]),
+                ("exec_mode", "oneshot"),
+                ("f", "*"),
+            ])
             .basic_auth(USERNAME, Some(PASSWORD))
             .send()
+            .await
             .unwrap();
-        let json: JsonValue = res.json().unwrap();
+        let json: JsonValue = res.json().await.unwrap();
+
+        println!("output: {:?}", json);
 
         json["results"].as_array().unwrap().clone()
     }
 
-    fn config() -> super::HecSinkConfig {
-        super::HecSinkConfig {
-            host: "http://localhost:8088/".into(),
-            token: get_token(),
-            host_field: "host".into(),
-            compression: Some(Compression::None),
-            batch_size: Some(1),
-            ..Default::default()
+    async fn config(
+        encoding: impl Into<EncodingConfig<Encoding>>,
+        indexed_fields: Vec<String>,
+    ) -> HecSinkConfig {
+        HecSinkConfig {
+            token: get_token().await,
+            endpoint: "http://localhost:8088/".into(),
+            host_key: "host".into(),
+            indexed_fields,
+            index: None,
+            sourcetype: None,
+            source: None,
+            encoding: encoding.into(),
+            compression: Compression::None,
+            batch: BatchConfig {
+                max_events: Some(1),
+                ..Default::default()
+            },
+            request: TowerRequestConfig::default(),
+            tls: None,
         }
     }
 
-    fn get_token() -> String {
+    async fn get_token() -> String {
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap();
 
-        let mut res = client
-            .get("https://localhost:8089/services/data/inputs/http?output_mode=json")
-            .basic_auth(USERNAME, Some(PASSWORD))
-            .send()
-            .unwrap();
+        let res = retry_until(
+            || {
+                client
+                    .get("https://localhost:8089/services/data/inputs/http?output_mode=json")
+                    .basic_auth(USERNAME, Some(PASSWORD))
+                    .send()
+            },
+            Duration::from_millis(500),
+            Duration::from_secs(30),
+        )
+        .await;
 
-        let json: JsonValue = res.json().unwrap();
+        let json: JsonValue = res.json().await.unwrap();
         let entries = json["entry"].as_array().unwrap().clone();
 
         if entries.is_empty() {
@@ -541,8 +806,6 @@ mod integration_tests {
             panic!("You don't have any HTTP Event Collector inputs set up in Splunk");
         }
 
-        let token = entries[0]["content"]["token"].as_str().unwrap().to_owned();
-
-        token
+        entries[0]["content"]["token"].as_str().unwrap().to_owned()
     }
 }

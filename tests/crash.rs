@@ -1,83 +1,108 @@
-use futures::{future, sync::mpsc, Async, AsyncSink, Sink, Stream};
+#![allow(clippy::type_complexity)]
+#![cfg(all(feature = "sources-socket", feature = "sinks-socket"))]
+
+use async_trait::async_trait;
+use futures::{compat::Future01CompatExt, future, FutureExt, Sink};
+use futures01::Stream;
 use serde::{Deserialize, Serialize};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::time::{delay_for, Duration};
 use vector::{
-    buffers::Acker,
-    test_util::{
-        block_on, next_addr, random_lines, receive, runtime, send_lines, shutdown_on_idle,
-        wait_for_tcp,
+    config::{self, GlobalOptions, SinkConfig, SinkContext, SourceConfig},
+    shutdown::ShutdownSignal,
+    test_util::{next_addr, random_lines, send_lines, start_topology, wait_for_tcp, CountReceiver},
+    Event, Pipeline,
+    {
+        sinks::{self, Healthcheck, VectorSink},
+        sources,
     },
-    topology::{
-        self,
-        config::{self, GlobalOptions},
-    },
-    Event, {sinks, sources},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PanicSink;
 
+#[async_trait]
 #[typetag::serde(name = "panic")]
-impl config::SinkConfig for PanicSink {
-    fn build(&self, _acker: Acker) -> Result<(sinks::RouterSink, sinks::Healthcheck), String> {
-        Ok((Box::new(PanicSink), Box::new(future::ok(()))))
+impl SinkConfig for PanicSink {
+    async fn build(&self, _cx: SinkContext) -> Result<(VectorSink, Healthcheck), vector::Error> {
+        Ok((
+            VectorSink::Sink(Box::new(PanicSink)),
+            future::ok(()).boxed(),
+        ))
     }
 
     fn input_type(&self) -> config::DataType {
         config::DataType::Log
     }
-}
 
-impl Sink for PanicSink {
-    type SinkItem = Event;
-    type SinkError = ();
-
-    fn start_send(
-        &mut self,
-        _item: Self::SinkItem,
-    ) -> Result<AsyncSink<Self::SinkItem>, Self::SinkError> {
-        panic!();
-    }
-
-    fn poll_complete(&mut self) -> Result<Async<()>, Self::SinkError> {
-        panic!();
+    fn sink_type(&self) -> &'static str {
+        "panic"
     }
 }
 
-#[test]
-fn test_sink_panic() {
+impl Sink<Event> for PanicSink {
+    type Error = ();
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        panic!()
+    }
+
+    fn start_send(self: Pin<&mut Self>, _item: Event) -> Result<(), Self::Error> {
+        panic!()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        panic!()
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        panic!()
+    }
+}
+
+#[tokio::test]
+async fn test_sink_panic() {
     let num_lines: usize = 10;
 
     let in_addr = next_addr();
     let out_addr = next_addr();
 
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
+    let mut config = config::Config::builder();
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_basic_tcp_config(in_addr),
+    );
     config.add_sink(
         "out",
         &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
     config.add_sink("panic", &["in"], PanicSink);
 
-    let mut rt = runtime();
+    let mut output_lines = CountReceiver::receive_lines(out_addr);
 
-    let output_lines = receive(&out_addr);
     std::panic::set_hook(Box::new(|_| {})); // Suppress panic print on background thread
-    let (topology, crash) = topology::start(config, &mut rt, false).unwrap();
+    let (topology, crash) = start_topology(config.build().unwrap(), false).await;
     // Wait for server to accept traffic
-    wait_for_tcp(in_addr);
+    wait_for_tcp(in_addr).await;
+    delay_for(Duration::from_millis(100)).await;
+
+    // Wait for output to connect
+    output_lines.connected().await;
 
     let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    let mut rt2 = runtime();
-    rt2.block_on(send).unwrap();
+    send_lines(in_addr, input_lines.clone()).await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
     let _ = std::panic::take_hook();
     assert!(crash.wait().next().is_some());
-    block_on(topology.stop()).unwrap();
-    shutdown_on_idle(rt);
+    topology.stop().compat().await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
-    let output_lines = output_lines.wait();
+    let output_lines = output_lines.await;
     assert_eq!(num_lines, output_lines.len());
     assert_eq!(input_lines, output_lines);
 }
@@ -85,67 +110,83 @@ fn test_sink_panic() {
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorSink;
 
+#[async_trait]
 #[typetag::serde(name = "panic")]
-impl config::SinkConfig for ErrorSink {
-    fn build(&self, _acker: Acker) -> Result<(sinks::RouterSink, sinks::Healthcheck), String> {
-        Ok((Box::new(ErrorSink), Box::new(future::ok(()))))
+impl SinkConfig for ErrorSink {
+    async fn build(&self, _cx: SinkContext) -> Result<(VectorSink, Healthcheck), vector::Error> {
+        Ok((
+            VectorSink::Sink(Box::new(ErrorSink)),
+            future::ok(()).boxed(),
+        ))
     }
 
     fn input_type(&self) -> config::DataType {
         config::DataType::Log
     }
-}
 
-impl Sink for ErrorSink {
-    type SinkItem = Event;
-    type SinkError = ();
-
-    fn start_send(
-        &mut self,
-        _item: Self::SinkItem,
-    ) -> Result<AsyncSink<Self::SinkItem>, Self::SinkError> {
-        Err(())
-    }
-
-    fn poll_complete(&mut self) -> Result<Async<()>, Self::SinkError> {
-        Err(())
+    fn sink_type(&self) -> &'static str {
+        "panic"
     }
 }
 
-#[test]
-fn test_sink_error() {
+impl Sink<Event> for ErrorSink {
+    type Error = ();
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Err(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, _item: Event) -> Result<(), Self::Error> {
+        Err(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Err(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Err(()))
+    }
+}
+
+#[tokio::test]
+async fn test_sink_error() {
     let num_lines: usize = 10;
 
     let in_addr = next_addr();
     let out_addr = next_addr();
 
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
+    let mut config = config::Config::builder();
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_basic_tcp_config(in_addr),
+    );
     config.add_sink(
         "out",
         &["in"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
     config.add_sink("error", &["in"], ErrorSink);
 
-    let mut rt = runtime();
+    let mut output_lines = CountReceiver::receive_lines(out_addr);
 
-    let output_lines = receive(&out_addr);
-
-    let (topology, crash) = topology::start(config, &mut rt, false).unwrap();
+    let (topology, crash) = start_topology(config.build().unwrap(), false).await;
     // Wait for server to accept traffic
-    wait_for_tcp(in_addr);
+    wait_for_tcp(in_addr).await;
+    delay_for(Duration::from_millis(100)).await;
+
+    // Wait for output to connect
+    output_lines.connected().await;
 
     let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    let mut rt2 = runtime();
-    rt2.block_on(send).unwrap();
+    send_lines(in_addr, input_lines.clone()).await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
     assert!(crash.wait().next().is_some());
-    block_on(topology.stop()).unwrap();
-    shutdown_on_idle(rt);
+    topology.stop().compat().await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
-    let output_lines = output_lines.wait();
+    let output_lines = output_lines.await;
     assert_eq!(num_lines, output_lines.len());
     assert_eq!(input_lines, output_lines);
 }
@@ -153,56 +194,66 @@ fn test_sink_error() {
 #[derive(Deserialize, Serialize, Debug)]
 struct ErrorSourceConfig;
 
+#[async_trait]
 #[typetag::serde(name = "tcp")]
-impl config::SourceConfig for ErrorSourceConfig {
-    fn build(
+impl SourceConfig for ErrorSourceConfig {
+    async fn build(
         &self,
         _name: &str,
         _globals: &GlobalOptions,
-        _out: mpsc::Sender<Event>,
-    ) -> Result<sources::Source, String> {
-        Ok(Box::new(future::err(())))
+        _shutdown: ShutdownSignal,
+        _out: Pipeline,
+    ) -> Result<sources::Source, vector::Error> {
+        Ok(Box::pin(future::err(())))
     }
 
     fn output_type(&self) -> config::DataType {
         config::DataType::Log
     }
+
+    fn source_type(&self) -> &'static str {
+        "tcp"
+    }
 }
 
-#[test]
-fn test_source_error() {
+#[tokio::test]
+async fn test_source_error() {
     let num_lines: usize = 10;
 
     let in_addr = next_addr();
     let out_addr = next_addr();
 
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
+    let mut config = config::Config::builder();
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_basic_tcp_config(in_addr),
+    );
     config.add_source("error", ErrorSourceConfig);
     config.add_sink(
         "out",
         &["in", "error"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
 
-    let mut rt = runtime();
+    let mut output_lines = CountReceiver::receive_lines(out_addr);
 
-    let output_lines = receive(&out_addr);
-
-    let (topology, crash) = topology::start(config, &mut rt, false).unwrap();
+    let (topology, crash) = start_topology(config.build().unwrap(), false).await;
     // Wait for server to accept traffic
-    wait_for_tcp(in_addr);
+    wait_for_tcp(in_addr).await;
+    delay_for(Duration::from_millis(100)).await;
+
+    // Wait for output to connect
+    output_lines.connected().await;
 
     let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    let mut rt2 = runtime();
-    rt2.block_on(send).unwrap();
+    send_lines(in_addr, input_lines.clone()).await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
     assert!(crash.wait().next().is_some());
-    block_on(topology.stop()).unwrap();
-    shutdown_on_idle(rt);
+    topology.stop().compat().await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
-    let output_lines = output_lines.wait();
+    let output_lines = output_lines.await;
     assert_eq!(num_lines, output_lines.len());
     assert_eq!(input_lines, output_lines);
 }
@@ -210,60 +261,68 @@ fn test_source_error() {
 #[derive(Deserialize, Serialize, Debug)]
 struct PanicSourceConfig;
 
+#[async_trait]
 #[typetag::serde(name = "tcp")]
-impl config::SourceConfig for PanicSourceConfig {
-    fn build(
+impl SourceConfig for PanicSourceConfig {
+    async fn build(
         &self,
         _name: &str,
         _globals: &GlobalOptions,
-        _out: mpsc::Sender<Event>,
-    ) -> Result<sources::Source, String> {
-        Ok(Box::new(future::lazy::<_, future::FutureResult<(), ()>>(
-            || panic!(),
-        )))
+        _shutdown: ShutdownSignal,
+        _out: Pipeline,
+    ) -> Result<sources::Source, vector::Error> {
+        Ok(Box::pin(async { panic!() }))
     }
 
     fn output_type(&self) -> config::DataType {
         config::DataType::Log
     }
+
+    fn source_type(&self) -> &'static str {
+        "tcp"
+    }
 }
 
-#[test]
-fn test_source_panic() {
+#[tokio::test]
+async fn test_source_panic() {
     let num_lines: usize = 10;
 
     let in_addr = next_addr();
     let out_addr = next_addr();
 
-    let mut config = config::Config::empty();
-    config.add_source("in", sources::tcp::TcpConfig::new(in_addr));
+    let mut config = config::Config::builder();
+    config.add_source(
+        "in",
+        sources::socket::SocketConfig::make_basic_tcp_config(in_addr),
+    );
     config.add_source("panic", PanicSourceConfig);
     config.add_sink(
         "out",
         &["in", "panic"],
-        sinks::tcp::TcpSinkConfig::new(out_addr.to_string()),
+        sinks::socket::SocketSinkConfig::make_basic_tcp_config(out_addr.to_string()),
     );
 
-    let mut rt = runtime();
-
-    let output_lines = receive(&out_addr);
+    let mut output_lines = CountReceiver::receive_lines(out_addr);
 
     std::panic::set_hook(Box::new(|_| {})); // Suppress panic print on background thread
-    let (topology, crash) = topology::start(config, &mut rt, false).unwrap();
+    let (topology, crash) = start_topology(config.build().unwrap(), false).await;
     // Wait for server to accept traffic
-    wait_for_tcp(in_addr);
+    wait_for_tcp(in_addr).await;
+    delay_for(Duration::from_millis(100)).await;
+
+    // Wait for output to connect
+    output_lines.connected().await;
 
     let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-    let send = send_lines(in_addr, input_lines.clone().into_iter());
-    let mut rt2 = runtime();
-    rt2.block_on(send).unwrap();
+    send_lines(in_addr, input_lines.clone()).await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
     let _ = std::panic::take_hook();
 
     assert!(crash.wait().next().is_some());
-    block_on(topology.stop()).unwrap();
-    shutdown_on_idle(rt);
+    topology.stop().compat().await.unwrap();
+    delay_for(Duration::from_millis(100)).await;
 
-    let output_lines = output_lines.wait();
+    let output_lines = output_lines.await;
     assert_eq!(num_lines, output_lines.len());
     assert_eq!(input_lines, output_lines);
 }

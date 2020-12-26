@@ -1,9 +1,13 @@
 use crate::{
     buffers::Acker,
-    event::{self, Event},
-    topology::config::{DataType, SinkConfig},
+    config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
+    emit,
+    internal_events::BlackholeEventReceived,
+    sinks::util::StreamSink,
+    Event,
 };
-use futures::{future, AsyncSink, Future, Poll, Sink, StartSend};
+use async_trait::async_trait;
+use futures::{future, stream::BoxStream, FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 
 pub struct BlackholeSink {
@@ -13,27 +17,49 @@ pub struct BlackholeSink {
     acker: Acker,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Clone, Debug, Derivative, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+#[derivative(Default)]
 pub struct BlackholeConfig {
+    #[derivative(Default(value = "1000"))]
+    #[serde(default = "default_print_amount")]
     pub print_amount: usize,
 }
 
-#[typetag::serde(name = "blackhole")]
-impl SinkConfig for BlackholeConfig {
-    fn build(&self, acker: Acker) -> Result<(super::RouterSink, super::Healthcheck), String> {
-        let sink = Box::new(BlackholeSink::new(self.clone(), acker));
-        let healthcheck = Box::new(healthcheck());
+fn default_print_amount() -> usize {
+    1000
+}
 
-        Ok((sink, healthcheck))
-    }
+inventory::submit! {
+    SinkDescription::new::<BlackholeConfig>("blackhole")
+}
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+impl GenerateConfig for BlackholeConfig {
+    fn generate_config() -> toml::Value {
+        toml::Value::try_from(&Self::default()).unwrap()
     }
 }
 
-fn healthcheck() -> impl Future<Item = (), Error = String> {
-    future::ok(())
+#[async_trait::async_trait]
+#[typetag::serde(name = "blackhole")]
+impl SinkConfig for BlackholeConfig {
+    async fn build(
+        &self,
+        cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
+        let sink = BlackholeSink::new(self.clone(), cx.acker());
+        let healthcheck = future::ok(()).boxed();
+
+        Ok((super::VectorSink::Stream(Box::new(sink)), healthcheck))
+    }
+
+    fn input_type(&self) -> DataType {
+        DataType::Any
+    }
+
+    fn sink_type(&self) -> &'static str {
+        "blackhole"
+    }
 }
 
 impl BlackholeSink {
@@ -47,53 +73,53 @@ impl BlackholeSink {
     }
 }
 
-impl Sink for BlackholeSink {
-    type SinkItem = Event;
-    type SinkError = ();
-
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let message_len = item
-            .as_log()
-            .get(&event::MESSAGE)
-            .map(|v| v.as_bytes().len())
+#[async_trait]
+impl StreamSink for BlackholeSink {
+    async fn run(&mut self, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
+        while let Some(event) = input.next().await {
+            let message_len = match event {
+                Event::Log(log) => serde_json::to_string(&log),
+                Event::Metric(metric) => serde_json::to_string(&metric),
+            }
+            .map(|v| v.len())
             .unwrap_or(0);
 
-        self.total_events += 1;
-        self.total_raw_bytes += message_len;
+            self.total_events += 1;
+            self.total_raw_bytes += message_len;
 
-        trace!(raw_bytes_counter = message_len, events_counter = 1);
+            emit!(BlackholeEventReceived {
+                byte_size: message_len
+            });
 
-        if self.total_events % self.config.print_amount == 0 {
-            info!({
-                events = self.total_events,
-                raw_bytes_collected = self.total_raw_bytes
-            }, "Total events collected");
+            if self.total_events % self.config.print_amount == 0 {
+                info!({
+                    events = self.total_events,
+                    raw_bytes_collected = self.total_raw_bytes
+                }, "Total events collected");
+            }
+
+            self.acker.ack(1);
         }
-
-        self.acker.ack(1);
-
-        Ok(AsyncSink::Ready)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        Ok(().into())
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffers::Acker;
     use crate::test_util::random_events_with_stream;
-    use crate::topology::config::SinkConfig;
 
     #[test]
-    fn blackhole() {
+    fn generate_config() {
+        crate::test_util::test_generate_config::<BlackholeConfig>();
+    }
+
+    #[tokio::test]
+    async fn blackhole() {
         let config = BlackholeConfig { print_amount: 10 };
-        let (sink, _) = config.build(Acker::Null).unwrap();
+        let mut sink = BlackholeSink::new(config, Acker::Null);
 
         let (_input_lines, events) = random_events_with_stream(100, 10);
-
-        sink.send_all(events).wait().unwrap();
+        let _ = sink.run(Box::pin(events)).await.unwrap();
     }
 }

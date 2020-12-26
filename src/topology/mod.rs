@@ -1,127 +1,184 @@
+//! Topology contains all topology based types.
+//!
+//! Topology is broken up into two main sections. The first
+//! section contains all the main topology types include `Topology`
+//! and the ability to start, stop and reload a config. The second
+//! part contains config related items including config traits for
+//! each type of component.
+
 pub mod builder;
-pub mod config;
 mod fanout;
+mod task;
 
-pub use self::config::Config;
-
-use crate::topology::builder::Pieces;
-
-use crate::buffers;
-use futures::{
-    future,
-    sync::{mpsc, oneshot},
-    Future, Stream,
+use crate::{
+    buffers,
+    config::{Config, ConfigDiff, HealthcheckOptions, Resource},
+    event::Event,
+    shutdown::SourceShutdownCoordinator,
+    topology::{
+        builder::Pieces,
+        task::{Task, TaskOutput},
+    },
+    trigger::DisabledTrigger,
 };
-use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
-use std::panic::AssertUnwindSafe;
-use std::time::{Duration, Instant};
-use stream_cancel::Trigger;
-use tokio::timer;
+use futures::{compat::Future01CompatExt, future, FutureExt, StreamExt, TryFutureExt};
+use futures01::{sync::mpsc, Future, Stream as Stream01};
+use std::{
+    collections::{HashMap, HashSet},
+    future::ready,
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex},
+};
+use tokio::time::{delay_until, interval, Duration, Instant};
 use tracing_futures::Instrument;
+
+// TODO: Result is only for compat, remove when not needed
+type TaskHandle = tokio::task::JoinHandle<Result<TaskOutput, ()>>;
+
+type BuiltBuffer = (
+    buffers::BufferInputCloner,
+    Arc<Mutex<Option<Box<dyn Stream01<Item = Event, Error = ()> + Send>>>>,
+    buffers::Acker,
+);
 
 #[allow(dead_code)]
 pub struct RunningTopology {
     inputs: HashMap<String, buffers::BufferInputCloner>,
     outputs: HashMap<String, fanout::ControlChannel>,
-    source_tasks: HashMap<String, oneshot::SpawnHandle<(), ()>>,
-    tasks: HashMap<String, oneshot::SpawnHandle<(), ()>>,
-    shutdown_triggers: HashMap<String, Trigger>,
+    source_tasks: HashMap<String, TaskHandle>,
+    tasks: HashMap<String, TaskHandle>,
+    shutdown_coordinator: SourceShutdownCoordinator,
+    detach_triggers: HashMap<String, DisabledTrigger>,
     config: Config,
     abort_tx: mpsc::UnboundedSender<()>,
 }
 
-pub fn start(
+pub async fn start_validated(
     config: Config,
-    rt: &mut tokio::runtime::Runtime,
-    require_healthy: bool,
-) -> Option<(RunningTopology, mpsc::UnboundedReceiver<()>)> {
-    validate(&config).and_then(|pieces| start_validated(config, pieces, rt, require_healthy))
-}
-
-pub fn start_validated(
-    config: Config,
+    diff: ConfigDiff,
     mut pieces: Pieces,
-    rt: &mut tokio::runtime::Runtime,
-    require_healthy: bool,
 ) -> Option<(RunningTopology, mpsc::UnboundedReceiver<()>)> {
     let (abort_tx, abort_rx) = mpsc::unbounded();
 
     let mut running_topology = RunningTopology {
         inputs: HashMap::new(),
         outputs: HashMap::new(),
-        config: Config::empty(),
-        shutdown_triggers: HashMap::new(),
+        config,
+        shutdown_coordinator: SourceShutdownCoordinator::default(),
+        detach_triggers: HashMap::new(),
         source_tasks: HashMap::new(),
         tasks: HashMap::new(),
         abort_tx,
     };
 
-    if !running_topology.run_healthchecks(&config, &mut pieces, rt, require_healthy) {
+    if !running_topology
+        .run_healthchecks(&diff, &mut pieces, running_topology.config.healthchecks)
+        .await
+    {
         return None;
     }
+    running_topology.connect_diff(&diff, &mut pieces).await;
+    running_topology.spawn_diff(&diff, pieces);
 
-    running_topology.spawn_all(config, pieces, rt);
     Some((running_topology, abort_rx))
 }
 
-pub fn validate(config: &Config) -> Option<Pieces> {
-    match builder::build_pieces(config) {
+pub async fn build_or_log_errors(
+    config: &Config,
+    diff: &ConfigDiff,
+    buffers: HashMap<String, BuiltBuffer>,
+) -> Option<Pieces> {
+    match builder::build_pieces(config, diff, buffers).await {
         Err(errors) => {
             for error in errors {
-                error!("Configuration error: {}", error);
+                error!(message = "Configuration error.", %error);
             }
-            return None;
+            None
         }
-        Ok((new_pieces, warnings)) => {
-            for warning in warnings {
-                error!("Configuration warning: {}", warning);
-            }
-            Some(new_pieces)
-        }
+        Ok(new_pieces) => Some(new_pieces),
     }
 }
 
+pub fn take_healthchecks(diff: &ConfigDiff, pieces: &mut Pieces) -> Vec<(String, Task)> {
+    (&diff.sinks.to_change | &diff.sinks.to_add)
+        .into_iter()
+        .filter_map(|name| {
+            pieces
+                .healthchecks
+                .remove(&name)
+                .map(move |task| (name, task))
+        })
+        .collect()
+}
+
 impl RunningTopology {
-    #[must_use]
+    /// Returned future will finish once all current sources have finished.
+    pub fn sources_finished(&self) -> future::BoxFuture<'static, ()> {
+        self.shutdown_coordinator.shutdown_tripwire()
+    }
+
+    /// Sends the shutdown signal to all sources and returns a future that resolves
+    /// once all components (sources, transforms, and sinks) have finished shutting down.
+    /// Transforms and sinks should shut down automatically once their input tasks finish.
+    /// Note that this takes ownership of `self`, so once this function returns everything in the
+    /// RunningTopology instance has been dropped except for the `tasks` map, which gets moved
+    /// into the returned future and is used to poll for when the tasks have completed. One the
+    /// returned future is dropped then everything from this RunningTopology instance is fully
+    /// dropped.
     pub fn stop(self) -> impl Future<Item = (), Error = ()> {
-        let mut running_tasks = self.tasks;
-
+        // Create handy handles collections of all tasks for the subsequent operations.
         let mut wait_handles = Vec::new();
-        let mut check_handles = HashMap::new();
+        // We need a Vec here since source components have two tasks. One for pump in self.tasks,
+        // and the other for source in self.source_tasks.
+        let mut check_handles = HashMap::<String, Vec<_>>::new();
 
-        for (name, task) in running_tasks.drain() {
-            let task = task
-                .or_else(|_| future::ok(())) // Consider an errored task to be shutdown
+        // We need to give some time to the sources to gracefully shutdown, so we will merge
+        // them with other tasks.
+        for (name, task) in self.tasks.into_iter().chain(self.source_tasks.into_iter()) {
+            let task = futures::compat::Compat::new(task)
+                .map(|_result| ())
+                .or_else(|_| futures01::future::ok(())) // Consider an errored task to be shutdown
                 .shared();
 
             wait_handles.push(task.clone());
-            check_handles.insert(name, task);
+            check_handles.entry(name).or_default().push(task);
         }
-        let mut check_handles2 = check_handles.clone();
 
+        // If we reach this, we will forcefully shutdown the sources.
         let deadline = Instant::now() + Duration::from_secs(60);
 
-        let timeout = timer::Delay::new(deadline)
-            .map(move |_| {
-                check_handles.retain(|_name, handle| {
+        // If we reach the deadline, this future will print out which components won't
+        // gracefully shutdown since we will start to forcefully shutdown the sources.
+        let mut check_handles2 = check_handles.clone();
+        let timeout = delay_until(deadline).map(move |_| {
+            // Remove all tasks that have shutdown.
+            check_handles2.retain(|_name, handles| {
+                retain(handles, |handle| {
                     handle.poll().map(|p| p.is_not_ready()).unwrap_or(false)
+                });
+                !handles.is_empty()
+            });
+            let remaining_components = check_handles2.keys().cloned().collect::<Vec<_>>();
+
+            error!(
+              message = "Failed to gracefully shut down in time. Killing components.",
+                components = ?remaining_components.join(", ")
+            );
+
+            Ok(())
+        });
+
+        // Reports in intervals which components are still running.
+        let reporter = interval(Duration::from_secs(5))
+            .inspect(move |_| {
+                // Remove all tasks that have shutdown.
+                check_handles.retain(|_name, handles| {
+                    retain(handles, |handle| {
+                        handle.poll().map(|p| p.is_not_ready()).unwrap_or(false)
+                    });
+                    !handles.is_empty()
                 });
                 let remaining_components = check_handles.keys().cloned().collect::<Vec<_>>();
-
-                error!(
-                    "Failed to gracefully shut down in time. Killing: {}",
-                    remaining_components.join(", ")
-                );
-            })
-            .map_err(|err| panic!("Timer error: {:?}", err));
-
-        let reporter = timer::Interval::new_interval(Duration::from_secs(5))
-            .inspect(move |_| {
-                check_handles2.retain(|_name, handle| {
-                    handle.poll().map(|p| p.is_not_ready()).unwrap_or(false)
-                });
-                let remaining_components = check_handles2.keys().cloned().collect::<Vec<_>>();
 
                 // TODO: replace with checked_duration_since once it's stable
                 let time_remaining = if deadline > Instant::now() {
@@ -131,255 +188,431 @@ impl RunningTopology {
                 };
 
                 info!(
-                    "Shutting down... Waiting on: {}. {}",
-                    remaining_components.join(", "),
-                    time_remaining
+                    message = "Shutting down... Waiting on running components.", remaining_components = ?remaining_components.join(", "), time_remaining = ?time_remaining
                 );
             })
-            .filter(|_| false) // Run indefinitely without emitting items
+            .filter(|_| ready(false)) // Run indefinitely without emitting items
             .into_future()
-            .map(|_| ())
-            .map_err(|(err, _)| panic!("Timer error: {:?}", err));
+            .map(|_| Ok(()));
 
-        let success = future::join_all(wait_handles)
+        // Finishes once all tasks have shutdown.
+        let success = futures01::future::join_all(wait_handles)
             .map(|_| ())
-            .map_err(|_: future::SharedError<()>| ());
+            .map_err(|_: futures01::future::SharedError<()>| ())
+            .compat();
 
-        future::select_all::<Vec<Box<dyn Future<Item = (), Error = ()> + Send>>>(vec![
-            Box::new(timeout),
-            Box::new(reporter),
-            Box::new(success),
+        // Aggregate future that ends once anything detects that all tasks have shutdown.
+        let shutdown_complete_future = future::select_all(vec![
+            Box::pin(timeout) as future::BoxFuture<'static, Result<(), ()>>,
+            Box::pin(reporter) as future::BoxFuture<'static, Result<(), ()>>,
+            Box::pin(success) as future::BoxFuture<'static, Result<(), ()>>,
         ])
-        .map(|_| ())
-        .map_err(|_| ())
+        .map(|(result, _, _)| result.map(|_| ()).map_err(|_| ()))
+        .compat();
+
+        // Now kick off the shutdown process by shutting down the sources.
+        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline);
+
+        source_shutdown_complete
+            .join(shutdown_complete_future)
+            .map(|_| ())
     }
 
-    pub fn reload_config_and_respawn(
-        &mut self,
-        new_config: Config,
-        rt: &mut tokio::runtime::Runtime,
-        require_healthy: bool,
-    ) -> bool {
-        if self.config.data_dir != new_config.data_dir {
-            error!("data_dir cannot be changed while reloading config file; reload aborted. Current value: {:?}", self.config.data_dir);
-            return false;
+    /// On Error, topology is in invalid state.
+    /// May change componenets even if reload fails.
+    pub async fn reload_config_and_respawn(&mut self, new_config: Config) -> Result<bool, ()> {
+        if self.config.global.data_dir != new_config.global.data_dir {
+            error!(message = "The data_dir cannot be changed while reloading config file; reload aborted.", data_dir = ?self.config.global.data_dir);
+            return Ok(false);
         }
 
-        match validate(&new_config) {
-            Some(mut new_pieces) => {
-                if !self.run_healthchecks(&new_config, &mut new_pieces, rt, require_healthy) {
-                    return false;
-                }
+        let diff = ConfigDiff::new(&self.config, &new_config);
 
-                self.spawn_all(new_config, new_pieces, rt);
-                true
+        // Checks passed so let's shutdown the difference.
+        let buffers = self.shutdown_diff(&diff, &new_config).await;
+
+        // Gives windows some time to make available any port
+        // released by shutdown componenets.
+        // Issue: https://github.com/timberio/vector/issues/3035
+        if cfg!(windows) {
+            // This value is guess work.
+            tokio::time::delay_for(Duration::from_millis(200)).await;
+        }
+
+        // Now let's actually build the new pieces.
+        if let Some(mut new_pieces) = build_or_log_errors(&new_config, &diff, buffers.clone()).await
+        {
+            if self
+                .run_healthchecks(&diff, &mut new_pieces, new_config.healthchecks)
+                .await
+            {
+                self.connect_diff(&diff, &mut new_pieces).await;
+                self.spawn_diff(&diff, new_pieces);
+                self.config = new_config;
+                // We have successfully changed to new config.
+                return Ok(true);
             }
-
-            None => false,
         }
+
+        // We need to rebuild the removed.
+        info!("Rebuilding old configuration.");
+        let diff = diff.flip();
+        if let Some(mut new_pieces) = build_or_log_errors(&self.config, &diff, buffers).await {
+            if self
+                .run_healthchecks(&diff, &mut new_pieces, self.config.healthchecks)
+                .await
+            {
+                self.connect_diff(&diff, &mut new_pieces).await;
+                self.spawn_diff(&diff, new_pieces);
+                // We have successfully returned to old config.
+                return Ok(false);
+            }
+        }
+
+        // We failed in rebuilding the old state.
+        error!("Failed in rebuilding the old configuration.");
+
+        Err(())
     }
 
-    fn run_healthchecks(
+    async fn run_healthchecks(
         &mut self,
-        new_config: &Config,
+        diff: &ConfigDiff,
         pieces: &mut Pieces,
-        rt: &mut tokio::runtime::Runtime,
-        require_healthy: bool,
+        options: HealthcheckOptions,
     ) -> bool {
-        let (_, sinks_to_change, sinks_to_add) =
-            to_remove_change_add(&self.config.sinks, &new_config.sinks);
+        if options.enabled {
+            let healthchecks = take_healthchecks(diff, pieces)
+                .into_iter()
+                .map(|(_, task)| task);
+            let healthchecks = future::try_join_all(healthchecks);
 
-        let healthchecks = (&sinks_to_change | &sinks_to_add)
-            .into_iter()
-            .map(|name| pieces.healthchecks.remove(&name).unwrap())
-            .collect::<Vec<_>>();
-        let healthchecks = futures::future::join_all(healthchecks).map(|_| ());
+            info!("Running healthchecks.");
+            if options.require_healthy {
+                let success = healthchecks.await;
 
-        info!("Running healthchecks.");
-        if require_healthy {
-            let success = rt.block_on(healthchecks);
-
-            if success.is_ok() {
-                info!("All healthchecks passed.");
-                true
+                if success.is_ok() {
+                    info!("All healthchecks passed.");
+                    true
+                } else {
+                    error!("Sinks unhealthy.");
+                    false
+                }
             } else {
-                error!("Sinks unhealthy.");
-                false
+                tokio::spawn(healthchecks);
+                true
             }
         } else {
-            rt.spawn(healthchecks);
             true
         }
     }
 
-    fn spawn_all(
+    /// Shutdowns removed and replaced pieces of topology.
+    /// Returns buffers to be reused.
+    async fn shutdown_diff(
         &mut self,
-        new_config: Config,
-        mut new_pieces: Pieces,
-        rt: &mut tokio::runtime::Runtime,
-    ) {
+        diff: &ConfigDiff,
+        new_config: &Config,
+    ) -> HashMap<String, BuiltBuffer> {
         // Sources
-        let (sources_to_remove, sources_to_change, sources_to_add) =
-            to_remove_change_add(&self.config.sources, &new_config.sources);
+        let timeout = Duration::from_secs(30); //sec
 
-        for name in sources_to_remove {
-            info!("Removing source {:?}", name);
+        // First pass to tell the sources to shut down.
+        let mut source_shutdown_complete_futures = Vec::new();
 
-            self.tasks.remove(&name).unwrap().forget();
-
-            self.remove_outputs(&name);
-            self.shutdown_source(&name);
+        // Only log that we are waiting for shutdown if we are actually removing
+        // sources.
+        if !diff.sources.to_remove.is_empty() {
+            info!(
+                message = "Waiting for sources to finish shutting down.", timeout = ?timeout.as_secs()
+            );
         }
 
-        for name in sources_to_change {
-            info!("Rebuilding source {:?}", name);
+        let deadline = Instant::now() + timeout;
+        for name in &diff.sources.to_remove {
+            info!(message = "Removing source.", name = ?name);
 
-            self.remove_outputs(&name);
-            self.shutdown_source(&name);
+            let previous = self.tasks.remove(name).unwrap();
+            drop(previous); // detach and forget
 
-            self.setup_outputs(&name, &mut new_pieces);
-
-            self.spawn_source(&name, &mut new_pieces, rt);
+            self.remove_outputs(name);
+            source_shutdown_complete_futures
+                .push(self.shutdown_coordinator.shutdown_source(name, deadline));
+        }
+        for name in &diff.sources.to_change {
+            self.remove_outputs(name);
+            source_shutdown_complete_futures
+                .push(self.shutdown_coordinator.shutdown_source(name, deadline));
         }
 
-        for name in sources_to_add {
-            info!("Starting source {:?}", name);
+        // Wait for the shutdowns to complete
 
-            self.setup_outputs(&name, &mut new_pieces);
-            self.spawn_source(&name, &mut new_pieces, rt);
+        // Only log message if there are actual futures to check.
+        if !source_shutdown_complete_futures.is_empty() {
+            info!(
+                "Waiting for up to {} seconds for sources to finish shutting down.",
+                timeout.as_secs()
+            );
+        }
+
+        futures01::future::join_all(source_shutdown_complete_futures)
+            .compat()
+            .await
+            .unwrap();
+
+        // Second pass now that all sources have shut down for final cleanup.
+        for name in diff.sources.removed_and_changed() {
+            if let Some(task) = self.source_tasks.remove(name) {
+                task.await.unwrap().unwrap();
+            }
         }
 
         // Transforms
-        let (transforms_to_remove, transforms_to_change, transforms_to_add) =
-            to_remove_change_add(&self.config.transforms, &new_config.transforms);
+        for name in &diff.transforms.to_remove {
+            info!(message = "Removing transform.", name = ?name);
 
-        for name in transforms_to_remove {
-            info!("Removing transform {:?}", name);
-
-            self.tasks.remove(&name).unwrap().forget();
+            let previous = self.tasks.remove(name).unwrap();
+            drop(previous); // detach and forget
 
             self.remove_inputs(&name);
             self.remove_outputs(&name);
         }
 
-        // Make sure all transform outputs are set up before another transform might try use
-        // it as an input
-        for name in &transforms_to_change {
-            self.setup_outputs(&name, &mut new_pieces);
-        }
-        for name in &transforms_to_add {
-            self.setup_outputs(&name, &mut new_pieces);
-        }
-
-        for name in transforms_to_change {
-            info!("Rebuilding transform {:?}", name);
-
-            self.replace_inputs(&name, &mut new_pieces);
-            self.spawn_transform(&name, &mut new_pieces, rt);
-        }
-
-        for name in transforms_to_add {
-            info!("Starting transform {:?}", name);
-
-            self.setup_inputs(&name, &mut new_pieces);
-            self.spawn_transform(&name, &mut new_pieces, rt);
-        }
-
         // Sinks
-        let (sinks_to_remove, sinks_to_change, sinks_to_add) =
-            to_remove_change_add(&self.config.sinks, &new_config.sinks);
 
-        for name in sinks_to_remove {
-            info!("Removing sink {:?}", name);
+        // Resource conflicts
+        // At this point both the old and the new config don't have
+        // conflicts in their resource usage. So if we combine their
+        // resources, all found conflicts are between
+        // to be removed and to be added components.
+        let remove_sink = diff
+            .sinks
+            .removed_and_changed()
+            .map(|name| (name, self.config.sinks[name].resources(name)));
+        let add_source = diff
+            .sources
+            .changed_and_added()
+            .map(|name| (name, new_config.sources[name].resources()));
+        let add_sink = diff
+            .sinks
+            .changed_and_added()
+            .map(|name| (name, new_config.sinks[name].resources(name)));
+        let conflicts = Resource::conflicts(
+            remove_sink.map(|(key, value)| ((true, key), value)).chain(
+                add_sink
+                    .chain(add_source)
+                    .map(|(key, value)| ((false, key), value)),
+            ),
+        )
+        .into_iter()
+        .flat_map(|(_, components)| components)
+        .collect::<HashSet<_>>();
+        // Existing conflicting sinks
+        let conflicting_sinks = conflicts
+            .into_iter()
+            .filter(|&(existing_sink, _)| existing_sink)
+            .map(|(_, name)| name.clone());
 
-            self.tasks.remove(&name).unwrap().forget();
+        // Buffer reuse
+        // We can reuse buffers whose configuration wasn't changed.
+        let reuse_buffers = diff
+            .sinks
+            .to_change
+            .iter()
+            .filter(|&name| self.config.sinks[name].buffer == new_config.sinks[name].buffer)
+            .cloned()
+            .collect::<HashSet<_>>();
 
+        let wait_for_sinks = conflicting_sinks
+            .chain(reuse_buffers.iter().cloned())
+            .collect::<HashSet<_>>();
+
+        // First pass
+
+        // Detach removed sinks
+        for name in &diff.sinks.to_remove {
+            info!(message = "Removing sink.", name = ?name);
             self.remove_inputs(&name);
         }
 
-        for name in sinks_to_change {
-            info!("Rebuilding sink {:?}", name);
-
-            self.spawn_sink(&name, &mut new_pieces, rt);
-            self.replace_inputs(&name, &mut new_pieces);
+        // Detach changed sinks
+        for name in &diff.sinks.to_change {
+            if reuse_buffers.contains(name) {
+                self.detach_triggers
+                    .remove(name)
+                    .unwrap()
+                    .into_inner()
+                    .cancel();
+            } else if wait_for_sinks.contains(name) {
+                self.detach_inputs(name);
+            }
         }
 
-        for name in sinks_to_add {
-            info!("Starting sink {:?}", name);
+        // Second pass for final cleanup
 
-            self.setup_inputs(&name, &mut new_pieces);
-            self.spawn_sink(&name, &mut new_pieces, rt);
+        // Cleanup removed
+        for name in &diff.sinks.to_remove {
+            let previous = self.tasks.remove(name).unwrap();
+            if wait_for_sinks.contains(name) {
+                debug!(message = "Waiting for sink to shutdown.", %name);
+                previous.await.unwrap().unwrap();
+            } else {
+                drop(previous); // detach and forget
+            }
         }
 
-        self.config = new_config;
+        // Cleanup changed and collect buffers to be reused
+        let mut buffers = HashMap::new();
+        for name in &diff.sinks.to_change {
+            if wait_for_sinks.contains(name) {
+                let previous = self.tasks.remove(name).unwrap();
+                debug!(message = "Waiting for sink to shutdown.", %name);
+                let buffer = previous.await.unwrap().unwrap();
+
+                if reuse_buffers.contains(name) {
+                    let tx = self.inputs.remove(name).unwrap();
+                    let (rx, acker) = match buffer {
+                        TaskOutput::Sink(rx, acker) => (rx, acker),
+                        _ => unreachable!(),
+                    };
+
+                    buffers.insert(name.clone(), (tx, Arc::new(Mutex::new(Some(rx))), acker));
+                }
+            }
+        }
+
+        buffers
     }
 
-    fn spawn_sink(
-        &mut self,
-        name: &String,
-        new_pieces: &mut builder::Pieces,
-        rt: &mut tokio::runtime::Runtime,
-    ) {
-        let task = new_pieces.tasks.remove(name).unwrap();
-        let task = handle_errors(task, self.abort_tx.clone());
-        let task = task.instrument(info_span!("sink", name = name.as_str()));
-        let spawned = oneshot::spawn(task, &rt.executor());
-        if let Some(previous) = self.tasks.insert(name.to_string(), spawned) {
-            previous.forget();
+    /// Rewires topology
+    async fn connect_diff(&mut self, diff: &ConfigDiff, new_pieces: &mut Pieces) {
+        // Sources
+        for name in diff.sources.changed_and_added() {
+            self.setup_outputs(&name, new_pieces);
+        }
+
+        // Transforms
+        // Make sure all transform outputs are set up before another transform might try use
+        // it as an input
+        for name in diff.transforms.changed_and_added() {
+            self.setup_outputs(&name, new_pieces);
+        }
+
+        for name in &diff.transforms.to_change {
+            self.replace_inputs(&name, new_pieces);
+        }
+
+        for name in &diff.transforms.to_add {
+            self.setup_inputs(&name, new_pieces);
+        }
+
+        // Sinks
+        for name in &diff.sinks.to_change {
+            self.replace_inputs(&name, new_pieces);
+        }
+
+        for name in &diff.sinks.to_add {
+            self.setup_inputs(&name, new_pieces);
         }
     }
 
-    fn spawn_transform(
-        &mut self,
-        name: &String,
-        new_pieces: &mut builder::Pieces,
-        rt: &mut tokio::runtime::Runtime,
-    ) {
-        let task = new_pieces.tasks.remove(name).unwrap();
-        let task = handle_errors(task, self.abort_tx.clone());
-        let task = task.instrument(info_span!("transform", name = name.as_str()));
-        let spawned = oneshot::spawn(task, &rt.executor());
-        if let Some(previous) = self.tasks.insert(name.to_string(), spawned) {
-            previous.forget();
+    /// Starts new and changed pieces of topology.
+    fn spawn_diff(&mut self, diff: &ConfigDiff, mut new_pieces: Pieces) {
+        // Sources
+        for name in &diff.sources.to_change {
+            info!(message = "Rebuilding source.", name = ?name);
+            self.spawn_source(name, &mut new_pieces);
+        }
+
+        for name in &diff.sources.to_add {
+            info!(message = "Starting source.", name = ?name);
+            self.spawn_source(&name, &mut new_pieces);
+        }
+
+        // Transforms
+        for name in &diff.transforms.to_change {
+            info!(message = "Rebuilding transform.", name = ?name);
+            self.spawn_transform(&name, &mut new_pieces);
+        }
+
+        for name in &diff.transforms.to_add {
+            info!(message = "Starting transform.", name = ?name);
+            self.spawn_transform(&name, &mut new_pieces);
+        }
+
+        // Sinks
+        for name in &diff.sinks.to_change {
+            info!(message = "Rebuilding sink.", name = ?name);
+            self.spawn_sink(&name, &mut new_pieces);
+        }
+
+        for name in &diff.sinks.to_add {
+            info!(message = "Starting sink.", name = ?name);
+            self.spawn_sink(&name, &mut new_pieces);
         }
     }
 
-    fn spawn_source(
-        &mut self,
-        name: &String,
-        new_pieces: &mut builder::Pieces,
-        rt: &mut tokio::runtime::Runtime,
-    ) {
+    fn spawn_sink(&mut self, name: &str, new_pieces: &mut builder::Pieces) {
         let task = new_pieces.tasks.remove(name).unwrap();
-        let task = handle_errors(task, self.abort_tx.clone());
-        let task = task.instrument(info_span!("source-pump", name = name.as_str()));
-        let spawned = oneshot::spawn(task, &rt.executor());
+        let span = error_span!(
+            "sink",
+            component_kind = "sink",
+            component_name = %task.name(),
+            component_type = %task.typetag(),
+        );
+        let task = handle_errors(task.compat(), self.abort_tx.clone()).instrument(span);
+        let spawned = tokio::spawn(task.compat());
         if let Some(previous) = self.tasks.insert(name.to_string(), spawned) {
-            previous.forget();
+            drop(previous); // detach and forget
+        }
+    }
+
+    fn spawn_transform(&mut self, name: &str, new_pieces: &mut builder::Pieces) {
+        let task = new_pieces.tasks.remove(name).unwrap();
+        let span = error_span!(
+            "transform",
+            component_kind = "transform",
+            component_name = %task.name(),
+            component_type = %task.typetag(),
+        );
+        let task = handle_errors(task.compat(), self.abort_tx.clone()).instrument(span);
+        let spawned = tokio::spawn(task.compat());
+        if let Some(previous) = self.tasks.insert(name.to_string(), spawned) {
+            drop(previous); // detach and forget
+        }
+    }
+
+    fn spawn_source(&mut self, name: &str, new_pieces: &mut builder::Pieces) {
+        let task = new_pieces.tasks.remove(name).unwrap();
+        let span = error_span!(
+            "source",
+            component_kind = "source",
+            component_name = %task.name(),
+            component_type = %task.typetag(),
+        );
+        let task = handle_errors(task.compat(), self.abort_tx.clone()).instrument(span.clone());
+        let spawned = tokio::spawn(task.compat());
+        if let Some(previous) = self.tasks.insert(name.to_string(), spawned) {
+            drop(previous); // detach and forget
         }
 
-        let shutdown_trigger = new_pieces.shutdown_triggers.remove(name).unwrap();
-        self.shutdown_triggers
-            .insert(name.clone(), shutdown_trigger);
+        self.shutdown_coordinator
+            .takeover_source(name, &mut new_pieces.shutdown_coordinator);
 
         let source_task = new_pieces.source_tasks.remove(name).unwrap();
-        let source_task = handle_errors(source_task, self.abort_tx.clone());
-        let source_task = source_task.instrument(info_span!("source", name = name.as_str()));
+        let source_task =
+            handle_errors(source_task.compat(), self.abort_tx.clone()).instrument(span);
         self.source_tasks
-            .insert(name.clone(), oneshot::spawn(source_task, &rt.executor()));
+            .insert(name.to_string(), tokio::spawn(source_task.compat()));
     }
 
-    fn shutdown_source(&mut self, name: &String) {
-        self.shutdown_triggers.remove(name).unwrap().cancel();
-        self.source_tasks.remove(name).wait().unwrap();
-    }
-
-    fn remove_outputs(&mut self, name: &String) {
+    fn remove_outputs(&mut self, name: &str) {
         self.outputs.remove(name);
     }
 
-    fn remove_inputs(&mut self, name: &String) {
+    fn remove_inputs(&mut self, name: &str) {
         self.inputs.remove(name);
+        self.detach_triggers.remove(name);
 
         let sink_inputs = self.config.sinks.get(name).map(|s| &s.inputs);
         let trans_inputs = self.config.transforms.get(name).map(|t| &t.inputs);
@@ -389,54 +622,60 @@ impl RunningTopology {
         if let Some(inputs) = inputs {
             for input in inputs {
                 if let Some(output) = self.outputs.get(input) {
-                    output
-                        .unbounded_send(fanout::ControlMessage::Remove(name.clone()))
-                        .unwrap();
+                    // This can only fail if we are disconnected, which is a valid situation.
+                    let _ = output.unbounded_send(fanout::ControlMessage::Remove(name.to_string()));
                 }
             }
         }
     }
 
-    fn setup_outputs(&mut self, name: &String, new_pieces: &mut builder::Pieces) {
+    fn setup_outputs(&mut self, name: &str, new_pieces: &mut builder::Pieces) {
         let output = new_pieces.outputs.remove(name).unwrap();
 
         for (sink_name, sink) in &self.config.sinks {
-            if sink.inputs.contains(&name) {
-                output
-                    .unbounded_send(fanout::ControlMessage::Add(
-                        sink_name.clone(),
-                        self.inputs[sink_name].get(),
-                    ))
-                    .unwrap();
+            if sink.inputs.iter().any(|i| i == name) {
+                // Sink may have been removed with the new config so it may not be present.
+                if let Some(input) = self.inputs.get(sink_name) {
+                    output
+                        .unbounded_send(fanout::ControlMessage::Add(sink_name.clone(), input.get()))
+                        .expect("Components shouldn't be spawned before connecting them together.");
+                }
             }
         }
         for (transform_name, transform) in &self.config.transforms {
-            if transform.inputs.contains(&name) {
-                output
-                    .unbounded_send(fanout::ControlMessage::Add(
-                        transform_name.clone(),
-                        self.inputs[transform_name].get(),
-                    ))
-                    .unwrap();
+            if transform.inputs.iter().any(|i| i == name) {
+                // Transform may have been removed with the new config so it may not be present.
+                if let Some(input) = self.inputs.get(transform_name) {
+                    output
+                        .unbounded_send(fanout::ControlMessage::Add(
+                            transform_name.clone(),
+                            input.get(),
+                        ))
+                        .expect("Components shouldn't be spawned before connecting them together.");
+                }
             }
         }
 
-        self.outputs.insert(name.clone(), output);
+        self.outputs.insert(name.to_string(), output);
     }
 
-    fn setup_inputs(&mut self, name: &String, new_pieces: &mut builder::Pieces) {
+    fn setup_inputs(&mut self, name: &str, new_pieces: &mut builder::Pieces) {
         let (tx, inputs) = new_pieces.inputs.remove(name).unwrap();
 
         for input in inputs {
-            self.outputs[&input]
-                .unbounded_send(fanout::ControlMessage::Add(name.clone(), tx.get()))
-                .unwrap();
+            // This can only fail if we are disconnected, which is a valid situation.
+            let _ = self.outputs[&input]
+                .unbounded_send(fanout::ControlMessage::Add(name.to_string(), tx.get()));
         }
 
-        self.inputs.insert(name.clone(), tx);
+        self.inputs.insert(name.to_string(), tx);
+        new_pieces.detach_triggers.remove(name).map(|trigger| {
+            self.detach_triggers
+                .insert(name.to_string(), trigger.into())
+        });
     }
 
-    fn replace_inputs(&mut self, name: &String, new_pieces: &mut builder::Pieces) {
+    fn replace_inputs(&mut self, name: &str, new_pieces: &mut builder::Pieces) {
         let (tx, inputs) = new_pieces.inputs.remove(name).unwrap();
 
         let sink_inputs = self.config.sinks.get(name).map(|s| &s.inputs);
@@ -444,7 +683,7 @@ impl RunningTopology {
         let old_inputs = sink_inputs
             .or(trans_inputs)
             .unwrap()
-            .into_iter()
+            .iter()
             .collect::<HashSet<_>>();
 
         let new_inputs = inputs.iter().collect::<HashSet<_>>();
@@ -455,928 +694,650 @@ impl RunningTopology {
 
         for input in inputs_to_remove {
             if let Some(output) = self.outputs.get(input) {
-                output
-                    .unbounded_send(fanout::ControlMessage::Remove(name.clone()))
-                    .unwrap();
+                // This can only fail if we are disconnected, which is a valid situation.
+                let _ = output.unbounded_send(fanout::ControlMessage::Remove(name.to_string()));
             }
         }
 
         for input in inputs_to_add {
-            self.outputs[input]
-                .unbounded_send(fanout::ControlMessage::Add(name.clone(), tx.get()))
-                .unwrap();
+            // This can only fail if we are disconnected, which is a valid situation.
+            let _ = self.outputs[input]
+                .unbounded_send(fanout::ControlMessage::Add(name.to_string(), tx.get()));
         }
 
         for &input in inputs_to_replace {
-            self.outputs[input]
-                .unbounded_send(fanout::ControlMessage::Replace(name.clone(), tx.get()))
-                .unwrap();
+            // This can only fail if we are disconnected, which is a valid situation.
+            let _ = self.outputs[input].unbounded_send(fanout::ControlMessage::Replace(
+                name.to_string(),
+                Some(tx.get()),
+            ));
         }
 
-        self.inputs.insert(name.clone(), tx);
+        self.inputs.insert(name.to_string(), tx);
+        new_pieces.detach_triggers.remove(name).map(|trigger| {
+            self.detach_triggers
+                .insert(name.to_string(), trigger.into())
+        });
+    }
+
+    fn detach_inputs(&mut self, name: &str) {
+        self.inputs.remove(name);
+        self.detach_triggers.remove(name);
+
+        let sink_inputs = self.config.sinks.get(name).map(|s| &s.inputs);
+        let trans_inputs = self.config.transforms.get(name).map(|t| &t.inputs);
+        let old_inputs = sink_inputs.or(trans_inputs).unwrap();
+
+        for input in old_inputs {
+            // This can only fail if we are disconnected, which is a valid situation.
+            let _ = self.outputs[input]
+                .unbounded_send(fanout::ControlMessage::Replace(name.to_string(), None));
+        }
+    }
+
+    /// Borrows the Config
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 }
 
-fn to_remove_change_add<C>(
-    old: &IndexMap<String, C>,
-    new: &IndexMap<String, C>,
-) -> (HashSet<String>, HashSet<String>, HashSet<String>)
-where
-    C: serde::Serialize + serde::Deserialize<'static>,
-{
-    let old_names = old.keys().cloned().collect::<HashSet<_>>();
-    let new_names = new.keys().cloned().collect::<HashSet<_>>();
-
-    let to_change = old_names
-        .intersection(&new_names)
-        .filter(|&n| {
-            // This is a hack around the issue of comparing two
-            // trait objects. Json is used here over toml since
-            // toml does not support serializing `None`.
-            let old_json = serde_json::to_vec(&old[n]).unwrap();
-            let new_json = serde_json::to_vec(&new[n]).unwrap();
-            old_json != new_json
-        })
-        .cloned()
-        .collect::<HashSet<_>>();
-
-    let to_remove = &old_names - &new_names;
-    let to_add = &new_names - &old_names;
-
-    (to_remove, to_change, to_add)
-}
-
-fn handle_errors(
-    task: builder::Task,
+fn handle_errors<T>(
+    task: impl Future<Item = T, Error = ()>,
     abort_tx: mpsc::UnboundedSender<()>,
-) -> impl Future<Item = (), Error = ()> {
+) -> impl Future<Item = T, Error = ()> {
     AssertUnwindSafe(task)
         .catch_unwind()
         .map_err(|_| ())
         .flatten()
-        .or_else(move |err| {
-            error!("Unhandled error");
+        .or_else(move |()| {
+            error!("An error occurred that vector couldn't handle.");
             let _ = abort_tx.unbounded_send(());
-            Err(err)
+            Err(())
         })
 }
 
-#[cfg(test)]
+/// If the closure returns false, then the element is removed
+fn retain<T>(vec: &mut Vec<T>, mut retain_filter: impl FnMut(&mut T) -> bool) {
+    let mut i = 0;
+    while let Some(data) = vec.get_mut(i) {
+        if retain_filter(data) {
+            i += 1;
+        } else {
+            let _ = vec.remove(i);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "sinks-console", feature = "sources-socket"))]
 mod tests {
-    use crate::sinks::tcp::TcpSinkConfig;
-    use crate::sources::tcp::TcpConfig;
-    use crate::test_util::{
-        block_on, next_addr, random_lines, receive, runtime, send_lines, shutdown_on_idle,
-        wait_for, wait_for_tcp,
+    use crate::{
+        config::Config,
+        sinks::console::{ConsoleSinkConfig, Encoding, Target},
+        sources::socket::SocketConfig,
+        test_util::{next_addr, start_topology},
     };
-    use crate::topology;
-    use crate::topology::config::Config;
-    use crate::transforms::sampler::SamplerConfig;
-    use futures::{future::Either, stream, Future, Stream};
-    use matches::assert_matches;
-    use std::collections::HashSet;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    use stream_cancel::{StreamExt, Tripwire};
-
-    #[test]
-    fn topology_add_sink() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out1_addr = next_addr();
-        let out2_addr = next_addr();
-
-        let output_lines1 = receive(&out1_addr);
-        let output_lines2 = receive(&out2_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_sink("out1", &["in"], TcpSinkConfig::new(out1_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        // Wait for server to accept traffic
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        new_config.add_sink("out2", &["in"], TcpSinkConfig::new(out2_addr.to_string()));
-
-        wait_for(|| output_lines1.count() >= 100);
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines1 = output_lines1.wait();
-        assert_eq!(num_lines * 2, output_lines1.len());
-        assert_eq!(input_lines1, &output_lines1[..num_lines]);
-        assert_eq!(input_lines2, &output_lines1[num_lines..]);
-
-        let output_lines2 = output_lines2.wait();
-        assert_eq!(num_lines, output_lines2.len());
-        assert_eq!(input_lines2, output_lines2);
-    }
-
-    #[test]
-    fn topology_remove_sink() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out1_addr = next_addr();
-        let out2_addr = next_addr();
-
-        let output_lines1 = receive(&out1_addr);
-        let output_lines2 = receive(&out2_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_sink("out1", &["in"], TcpSinkConfig::new(out1_addr.to_string()));
-        old_config.add_sink("out2", &["in"], TcpSinkConfig::new(out2_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        // Wait for server to accept traffic
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        new_config.sinks.remove(&"out2".to_string());
-
-        wait_for(|| output_lines1.count() >= 100);
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        // out2 should disconnect after the reload
-        let output_lines2 = output_lines2.wait();
-
-        let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines1 = output_lines1.wait();
-        assert_eq!(num_lines * 2, output_lines1.len());
-        assert_eq!(input_lines1, &output_lines1[..num_lines]);
-        assert_eq!(input_lines2, &output_lines1[num_lines..]);
-
-        assert_eq!(num_lines, output_lines2.len());
-        assert_eq!(input_lines1, output_lines2);
-    }
-
-    #[test]
-    fn topology_change_sink() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out1_addr = next_addr();
-        let out2_addr = next_addr();
-
-        let output_lines1 = receive(&out1_addr);
-        let output_lines2 = receive(&out2_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_sink("out", &["in"], TcpSinkConfig::new(out1_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        // Wait for server to accept traffic
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        new_config.sinks[&"out".to_string()].inner =
-            Box::new(TcpSinkConfig::new(out2_addr.to_string()));
-
-        wait_for(|| output_lines1.count() >= 100);
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines1 = output_lines1.wait();
-        assert_eq!(num_lines, output_lines1.len());
-        assert_eq!(input_lines1, output_lines1);
-
-        let output_lines2 = output_lines2.wait();
-        assert_eq!(num_lines, output_lines2.len());
-        assert_eq!(input_lines2, output_lines2);
-    }
-
-    // The previous test pauses to make sure the old version of the sink has received all messages
-    // sent before the reload. This test does not pause, making sure the new sink is atomically
-    // swapped in for the old one and that no events are lost in the changeover.
-    #[test]
-    fn topology_change_sink_no_gap() {
-        let in_addr = next_addr();
-        let out1_addr = next_addr();
-        let out2_addr = next_addr();
-
-        for _ in 0..10 {
-            let mut rt = runtime();
-
-            let output_lines1 = receive(&out1_addr);
-            let output_lines2 = receive(&out2_addr);
-
-            let mut old_config = Config::empty();
-            old_config.add_source("in", TcpConfig::new(in_addr));
-            old_config.add_sink("out", &["in"], TcpSinkConfig::new(out1_addr.to_string()));
-            let mut new_config = old_config.clone();
-
-            let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-            // Wait for server to accept traffic
-            wait_for_tcp(in_addr);
-
-            let (input_trigger, input_tripwire) = Tripwire::new();
-
-            let num_input_lines = Arc::new(AtomicUsize::new(0));
-            let num_input_lines2 = Arc::clone(&num_input_lines);
-            let input_lines = stream::iter_ok(random_lines(100))
-                .take_until(input_tripwire)
-                .inspect(move |_| {
-                    num_input_lines2.fetch_add(1, Ordering::Relaxed);
-                })
-                .wait()
-                .map(|r: Result<String, ()>| r.unwrap());
-
-            let send = send_lines(in_addr, input_lines);
-            rt.spawn(send);
-
-            new_config.sinks[&"out".to_string()].inner =
-                Box::new(TcpSinkConfig::new(out2_addr.to_string()));
-
-            wait_for(|| output_lines1.count() > 0);
-
-            topology.reload_config_and_respawn(new_config, &mut rt, false);
-            wait_for(|| output_lines2.count() > 0);
-
-            // Shut down server
-            input_trigger.cancel();
-            block_on(topology.stop()).unwrap();
-            let output_lines1 = output_lines1.wait();
-            let output_lines2 = output_lines2.wait();
-            shutdown_on_idle(rt);
-
-            assert!(output_lines1.len() > 0);
-            assert!(output_lines2.len() > 0);
-
-            assert_eq!(
-                num_input_lines.load(Ordering::Relaxed),
-                output_lines1.len() + output_lines2.len()
-            );
-        }
-    }
-
-    #[test]
-    fn topology_add_source() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_sink("out", &[], TcpSinkConfig::new(out_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        assert!(topology::start(old_config, &mut rt, false).is_none());
-
-        new_config.add_source("in", TcpConfig::new(in_addr));
-        new_config.sinks[&"out".to_string()]
-            .inputs
-            .push("in".to_string());
-
-        let (topology, _crash) = topology::start(new_config, &mut rt, false).unwrap();
-
-        wait_for_tcp(in_addr);
-
-        let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines = output_lines.wait();
-        assert_eq!(num_lines, output_lines.len());
-        assert_eq!(input_lines, output_lines);
-    }
-
-    #[test]
-    fn topology_remove_source() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_sink("out", &["in"], TcpSinkConfig::new(out_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        wait_for_tcp(in_addr);
-
-        let input_lines = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        new_config.sources.remove(&"in".to_string());
-        new_config.sinks[&"out".to_string()].inputs.clear();
-
-        assert!(!topology.reload_config_and_respawn(new_config, &mut rt, false));
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines = output_lines.wait();
-        assert_eq!(num_lines, output_lines.len());
-        assert_eq!(input_lines, output_lines);
-    }
-
-    #[test]
-    fn topology_remove_source_add_source_with_same_port() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines1 = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in1", TcpConfig::new(in_addr));
-        old_config.add_sink("out", &["in1"], TcpSinkConfig::new(out_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        wait_for(|| output_lines1.count() >= num_lines);
-
-        new_config.sources.remove(&"in1".to_string());
-        new_config.add_source("in2", TcpConfig::new(in_addr));
-        new_config.sinks[&"out".to_string()].inputs = vec!["in2".to_string()];
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        // The sink gets rebuilt, causing it to open a new connection
-        let output_lines1 = output_lines1.wait();
-        let output_lines2 = receive(&out_addr);
-
-        let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        assert_eq!(num_lines, output_lines1.len());
-        assert_eq!(input_lines1, output_lines1);
-
-        let output_lines2 = output_lines2.wait();
-        assert_eq!(num_lines, output_lines2.len());
-        assert_eq!(input_lines2, output_lines2);
-    }
-
-    #[test]
-    #[ignore]
-    fn topology_replace_source_transform_and_sink() {
-        crate::test_util::trace_init();
-        let mut rt = runtime();
-
-        let in_addr1 = next_addr();
-        let out_addr1 = next_addr();
-        let mut old_config = Config::empty();
-        old_config.add_source("in1", TcpConfig::new(in_addr1));
-        old_config.add_transform(
-            "trans1",
-            &["in1"],
-            SamplerConfig {
-                rate: 2,
-                pass_list: vec![],
-            },
-        );
-        old_config.add_sink(
-            "out1",
-            &["trans1"],
-            TcpSinkConfig::new(out_addr1.to_string()),
-        );
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        wait_for_tcp(in_addr1);
-
-        let in_addr2 = next_addr();
-        let out_addr2 = next_addr();
-        let mut new_config = Config::empty();
-        new_config.add_source("in2", TcpConfig::new(in_addr2));
-        new_config.add_transform(
-            "trans2",
-            &["in2"],
-            SamplerConfig {
-                rate: 2,
-                pass_list: vec![],
-            },
-        );
-        new_config.add_sink(
-            "out2",
-            &["trans2"],
-            TcpSinkConfig::new(out_addr2.to_string()),
-        );
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let output_lines2 = receive(&out_addr2);
-        let input_lines2 = random_lines(100).take(1).collect::<Vec<_>>();
-        let send = send_lines(in_addr2, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-        assert_eq!(input_lines2, output_lines2.wait());
-    }
-
-    #[test]
-    fn topology_change_source() {
-        let mut rt = runtime();
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source(
-            "in",
-            TcpConfig {
-                address: in_addr,
-                max_length: 20,
-                host_key: None,
-                shutdown_timeout_secs: 30,
-            },
-        );
-        old_config.add_sink("out", &["in"], TcpSinkConfig::new(out_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = vec![
-            "short1",
-            "mediummedium1",
-            "longlonglonglonglonglong1",
-            "mediummedium2",
-            "short2",
-        ];
-
-        for &line in &input_lines1 {
-            rt.block_on(send_lines(in_addr, std::iter::once(line.to_owned())))
-                .unwrap();
-        }
-
-        wait_for(|| output_lines.count() >= 4);
-
-        new_config.sources[&"in".to_string()] = Box::new(TcpConfig {
-            address: in_addr,
-            max_length: 10,
-            host_key: None,
-            shutdown_timeout_secs: 30,
-        });
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        wait_for_tcp(in_addr);
-
-        let input_lines2 = vec![
-            "short3",
-            "mediummedium3",
-            "longlonglonglonglonglong2",
-            "mediummedium4",
-            "short4",
-        ];
-
-        for &line in &input_lines2 {
-            rt.block_on(send_lines(in_addr, std::iter::once(line.to_owned())))
-                .unwrap();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines = output_lines.wait().into_iter().collect::<HashSet<_>>();
-        assert_eq!(
-            output_lines,
-            vec![
-                // From old
-                "short1".to_owned(),
-                "mediummedium1".to_owned(),
-                "mediummedium2".to_owned(),
-                "short2".to_owned(),
-                // From new
-                "short3".to_owned(),
-                "short4".to_owned(),
-            ]
-            .into_iter()
-            .collect::<HashSet<_>>()
-        );
-    }
-
-    #[test]
-    fn topology_add_transform() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines1 = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_sink("out", &["in"], TcpSinkConfig::new(out_addr.to_string()));
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        // Wait for server to accept traffic
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        new_config.add_transform(
-            "sampler",
-            &["in"],
-            SamplerConfig {
-                rate: 2,
-                pass_list: vec![],
-            },
-        );
-        new_config.sinks[&"out".to_string()].inputs = vec!["sampler".to_string()];
-
-        wait_for(|| output_lines1.count() >= num_lines);
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        // The sink gets rebuilt, causing it to open a new connection
-        let output_lines1 = output_lines1.wait();
-        let output_lines2 = receive(&out_addr);
-
-        let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        assert_eq!(num_lines, output_lines1.len());
-        assert_eq!(input_lines1, output_lines1);
-
-        let output_lines2 = output_lines2.wait();
-        assert!(output_lines2.len() > 0);
-        assert!(output_lines2.len() < num_lines);
-    }
-
-    #[test]
-    fn topology_remove_transform() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines1 = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_transform(
-            "sampler",
-            &["in"],
-            SamplerConfig {
-                rate: 2,
-                pass_list: vec![],
-            },
-        );
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn topology_doesnt_reload_new_data_dir() {
+        let mut old_config = Config::builder();
+        old_config.add_source("in", SocketConfig::make_basic_tcp_config(next_addr()));
         old_config.add_sink(
             "out",
-            &["sampler"],
-            TcpSinkConfig::new(out_addr.to_string()),
-        );
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        // Wait for server to accept traffic
-        wait_for_tcp(in_addr);
-
-        let input_lines1 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        new_config.transforms.remove(&"sampler".to_string());
-        new_config.sinks[&"out".to_string()].inputs = vec!["in".to_string()];
-
-        wait_for(|| output_lines1.count() >= 1);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        // The sink gets rebuilt, causing it to open a new connection
-        let output_lines1 = output_lines1.wait();
-        let output_lines2 = receive(&out_addr);
-
-        let input_lines2 = random_lines(100).take(num_lines).collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        assert!(output_lines1.len() > 0);
-        assert!(output_lines1.len() < num_lines);
-
-        let output_lines2 = output_lines2.wait();
-        assert_eq!(num_lines, output_lines2.len());
-        assert_eq!(input_lines2, output_lines2);
-    }
-
-    #[test]
-    fn topology_change_transform() {
-        let mut rt = runtime();
-
-        let num_lines: usize = 100;
-
-        let in_addr = next_addr();
-        let out_addr = next_addr();
-
-        let output_lines = receive(&out_addr);
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(in_addr));
-        old_config.add_transform(
-            "sampler",
-            &["in"],
-            SamplerConfig {
-                rate: 2,
-                pass_list: vec![],
+            &[&"in"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
             },
         );
-        old_config.add_sink(
-            "out",
-            &["sampler"],
-            TcpSinkConfig::new(out_addr.to_string()),
-        );
+        old_config.global.data_dir = Some(Path::new("/asdf").to_path_buf());
         let mut new_config = old_config.clone();
 
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
+        let (mut topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
 
-        // Wait for server to accept traffic
-        wait_for_tcp(in_addr);
+        new_config.global.data_dir = Some(Path::new("/qwerty").to_path_buf());
 
-        let input_lines1 = random_lines(100)
-            .map(|s| s + "before")
-            .take(num_lines)
-            .collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines1.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        wait_for(|| output_lines.count() >= 1);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        new_config.transforms[&"sampler".to_string()].inner = Box::new(SamplerConfig {
-            rate: 10,
-            pass_list: vec![],
-        });
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let input_lines2 = random_lines(100)
-            .map(|s| s + "after")
-            .take(num_lines)
-            .collect::<Vec<_>>();
-        let send = send_lines(in_addr, input_lines2.clone().into_iter());
-        rt.block_on(send).unwrap();
-
-        // Shut down server
-        block_on(topology.stop()).unwrap();
-        shutdown_on_idle(rt);
-
-        let output_lines = output_lines.wait();
-
-        let num_before = output_lines
-            .iter()
-            .filter(|&l| l.ends_with("before"))
-            .count();
-        let num_after = output_lines
-            .iter()
-            .filter(|&l| l.ends_with("after"))
-            .count();
-
-        assert!(num_before > 0);
-        assert!(num_before < num_lines);
-
-        assert!(num_after > 0);
-        assert!(num_after < num_lines);
-
-        assert!(num_before > num_after);
-    }
-
-    #[test]
-    fn topology_doesnt_reload_new_data_dir() {
-        let mut rt = runtime();
-
-        use std::path::Path;
-
-        let mut old_config = Config::empty();
-        old_config.add_source("in", TcpConfig::new(next_addr()));
-        old_config.data_dir = Some(Path::new("/asdf").to_path_buf());
-        let mut new_config = old_config.clone();
-
-        let (mut topology, _crash) = topology::start(old_config, &mut rt, false).unwrap();
-
-        new_config.data_dir = Some(Path::new("/qwerty").to_path_buf());
-
-        topology.reload_config_and_respawn(new_config, &mut rt, false);
+        topology
+            .reload_config_and_respawn(new_config.build().unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(
-            topology.config.data_dir,
+            topology.config.global.data_dir,
             Some(Path::new("/asdf").to_path_buf())
         );
     }
+}
 
-    #[test]
-    fn topology_reload_healthchecks() {
-        fn receive_one(
-            addr1: &std::net::SocketAddr,
-            addr2: &std::net::SocketAddr,
-        ) -> impl Future<Item = Either<String, String>, Error = ()> {
-            use tokio::codec::{FramedRead, LinesCodec};
-            use tokio::net::TcpListener;
+#[cfg(all(
+    test,
+    feature = "sinks-console",
+    feature = "sources-splunk_hec",
+    feature = "sources-generator",
+    feature = "sinks-prometheus",
+    feature = "transforms-log_to_metric",
+    feature = "sinks-socket",
+    feature = "leveldb"
+))]
+mod reload_tests {
+    use crate::buffers::{BufferConfig, WhenFull};
+    use crate::config::Config;
+    use crate::sinks::console::{ConsoleSinkConfig, Encoding, Target};
+    use crate::sinks::prometheus::exporter::PrometheusExporterConfig;
+    use crate::sources::generator::GeneratorConfig;
+    use crate::sources::splunk_hec::SplunkConfig;
+    use crate::test_util::{next_addr, start_topology, temp_dir, wait_for_tcp};
+    use crate::transforms::log_to_metric::{GaugeConfig, LogToMetricConfig, MetricConfig};
+    use futures::{compat::Stream01CompatExt, StreamExt};
+    use std::net::{SocketAddr, TcpListener};
+    use std::time::Duration;
+    use tokio::time::delay_for;
 
-            let listener1 = TcpListener::bind(addr1).unwrap();
-            let listener2 = TcpListener::bind(addr2).unwrap();
+    #[tokio::test]
+    async fn topology_reuse_old_port() {
+        let address = next_addr();
 
-            let future1 = listener1
-                .incoming()
-                .take(1)
-                .map(|socket| FramedRead::new(socket, LinesCodec::new()))
-                .flatten()
-                .map_err(|e| panic!("{:?}", e))
-                .into_future()
-                .map(|(i, _)| i.unwrap());
+        let mut old_config = Config::builder();
+        old_config.add_source("in1", SplunkConfig::on(address));
+        old_config.add_sink(
+            "out",
+            &[&"in1"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
+            },
+        );
 
-            let future2 = listener2
-                .incoming()
-                .take(1)
-                .map(|socket| FramedRead::new(socket, LinesCodec::new()))
-                .flatten()
-                .map_err(|e| panic!("{:?}", e))
-                .into_future()
-                .map(|(i, _)| i.unwrap());
+        let mut new_config = Config::builder();
+        new_config.add_source("in2", SplunkConfig::on(address));
+        new_config.add_sink(
+            "out",
+            &[&"in2"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
+            },
+        );
 
-            future1
-                .select2(future2)
-                .map_err(|_| panic!())
-                .map(|either| match either {
-                    Either::A((result, _)) => Either::A(result),
-                    Either::B((result, _)) => Either::B(result),
-                })
+        let (mut topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
+        assert!(topology
+            .reload_config_and_respawn(new_config.build().unwrap())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn topology_rebuild_old() {
+        let address_0 = next_addr();
+        let address_1 = next_addr();
+
+        let mut old_config = Config::builder();
+        old_config.add_source("in1", SplunkConfig::on(address_0));
+        old_config.add_sink(
+            "out",
+            &[&"in1"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
+            },
+        );
+
+        let mut new_config = Config::builder();
+        new_config.add_source("in1", SplunkConfig::on(address_1));
+        new_config.add_sink(
+            "out",
+            &[&"in1"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
+            },
+        );
+
+        // Will cause the new_config to fail on build
+        let _bind = TcpListener::bind(address_1).unwrap();
+
+        let (mut topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
+        assert!(!topology
+            .reload_config_and_respawn(new_config.build().unwrap())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn topology_old() {
+        let address = next_addr();
+
+        let mut old_config = Config::builder();
+        old_config.add_source("in1", SplunkConfig::on(address));
+        old_config.add_sink(
+            "out",
+            &[&"in1"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
+            },
+        );
+
+        let (mut topology, _crash) =
+            start_topology(old_config.clone().build().unwrap(), false).await;
+        assert!(topology
+            .reload_config_and_respawn(old_config.build().unwrap())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn topology_reuse_old_port_sink() {
+        let address = next_addr();
+
+        let source = GeneratorConfig::repeat(vec!["msg".to_string()], usize::MAX, Some(0.001));
+        let transform = LogToMetricConfig {
+            metrics: vec![MetricConfig::Gauge(GaugeConfig {
+                field: "message".to_string(),
+                name: None,
+                namespace: None,
+                tags: None,
+            })],
+        };
+
+        let mut old_config = Config::builder();
+        old_config.add_source("in", source.clone());
+        old_config.add_transform("trans", &[&"in"], transform.clone());
+        old_config.add_sink(
+            "out1",
+            &[&"trans"],
+            PrometheusExporterConfig {
+                address,
+                flush_period_secs: 1,
+                ..PrometheusExporterConfig::default()
+            },
+        );
+
+        let mut new_config = Config::builder();
+        new_config.add_source("in", source.clone());
+        new_config.add_transform("trans", &[&"in"], transform.clone());
+        new_config.add_sink(
+            "out1",
+            &[&"trans"],
+            PrometheusExporterConfig {
+                address,
+                flush_period_secs: 2,
+                ..PrometheusExporterConfig::default()
+            },
+        );
+
+        reload_sink_test(
+            old_config.build().unwrap(),
+            new_config.build().unwrap(),
+            address,
+            address,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn topology_reuse_old_port_cross_dependecy() {
+        // Reload with source that uses address of changed sink.
+        let address_0 = next_addr();
+        let address_1 = next_addr();
+
+        let transform = LogToMetricConfig {
+            metrics: vec![MetricConfig::Gauge(GaugeConfig {
+                field: "message".to_string(),
+                name: None,
+                namespace: None,
+                tags: None,
+            })],
+        };
+
+        let mut old_config = Config::builder();
+        old_config.add_source(
+            "in",
+            GeneratorConfig::repeat(vec!["msg".to_string()], usize::MAX, Some(0.001)),
+        );
+        old_config.add_transform("trans", &[&"in"], transform.clone());
+        old_config.add_sink(
+            "out1",
+            &[&"trans"],
+            PrometheusExporterConfig {
+                address: address_0,
+                flush_period_secs: 1,
+                ..PrometheusExporterConfig::default()
+            },
+        );
+
+        let mut new_config = Config::builder();
+        new_config.add_source("in", SplunkConfig::on(address_0));
+        new_config.add_transform("trans", &[&"in"], transform.clone());
+        new_config.add_sink(
+            "out1",
+            &[&"trans"],
+            PrometheusExporterConfig {
+                address: address_1,
+                flush_period_secs: 1,
+                ..PrometheusExporterConfig::default()
+            },
+        );
+
+        reload_sink_test(
+            old_config.build().unwrap(),
+            new_config.build().unwrap(),
+            address_0,
+            address_1,
+        )
+        .await;
+    }
+
+    #[tokio::test(core_threads = 2)]
+    async fn topology_disk_buffer_conflict() {
+        let address_0 = next_addr();
+        let address_1 = next_addr();
+        let data_dir = temp_dir();
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let mut old_config = Config::builder();
+        old_config.global.data_dir = Some(data_dir);
+        old_config.add_source(
+            "in",
+            GeneratorConfig::repeat(vec!["msg".to_string()], usize::MAX, Some(0.001)),
+        );
+        old_config.add_transform(
+            "trans",
+            &[&"in"],
+            LogToMetricConfig {
+                metrics: vec![MetricConfig::Gauge(GaugeConfig {
+                    field: "message".to_string(),
+                    name: None,
+                    namespace: None,
+                    tags: None,
+                })],
+            },
+        );
+        old_config.add_sink(
+            "out",
+            &[&"trans"],
+            PrometheusExporterConfig {
+                address: address_0,
+                flush_period_secs: 1,
+                ..PrometheusExporterConfig::default()
+            },
+        );
+        old_config.sinks["out"].buffer = BufferConfig::Disk {
+            max_size: 1024,
+            when_full: WhenFull::Block,
+        };
+
+        let mut new_config = old_config.clone();
+        new_config.sinks["out"].inner = Box::new(PrometheusExporterConfig {
+            address: address_1,
+            flush_period_secs: 1,
+            ..PrometheusExporterConfig::default()
+        });
+        new_config.sinks["out"].buffer = BufferConfig::Disk {
+            max_size: 2048,
+            when_full: WhenFull::Block,
+        };
+
+        reload_sink_test(
+            old_config.build().unwrap(),
+            new_config.build().unwrap(),
+            address_0,
+            address_1,
+        )
+        .await;
+    }
+    async fn reload_sink_test(
+        old_config: Config,
+        new_config: Config,
+        old_address: SocketAddr,
+        new_address: SocketAddr,
+    ) {
+        let (mut topology, crash) = start_topology(old_config, false).await;
+        let mut crash = crash.compat();
+
+        // Wait for sink to come online
+        wait_for_tcp(old_address).await;
+
+        // Give topology some time to run
+        delay_for(Duration::from_secs(1)).await;
+
+        assert!(topology
+            .reload_config_and_respawn(new_config)
+            .await
+            .unwrap());
+
+        // Give old time to shutdown if it didn't, and new one to come online.
+        delay_for(Duration::from_secs(2)).await;
+
+        tokio::select! {
+            _ = wait_for_tcp(new_address) => {}//Success
+            _ = crash.next() => panic!(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "sinks-console", feature = "sources-generator"))]
+mod source_finished_tests {
+    use crate::{
+        config::Config,
+        sinks::console::{ConsoleSinkConfig, Encoding, Target},
+        sources::generator::GeneratorConfig,
+        test_util::start_topology,
+    };
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn sources_finished() {
+        let mut old_config = Config::builder();
+        let generator = GeneratorConfig::repeat(vec!["text".to_owned()], 1, None);
+        old_config.add_source("in", generator);
+        old_config.add_sink(
+            "out",
+            &[&"in"],
+            ConsoleSinkConfig {
+                target: Target::Stdout,
+                encoding: Encoding::Text.into(),
+            },
+        );
+
+        let (topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
+
+        timeout(Duration::from_secs(2), topology.sources_finished())
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "sinks-blackhole",
+    feature = "sources-stdin",
+    feature = "transforms-json_parser"
+))]
+mod transient_state_tests {
+    use crate::{
+        config::{Config, DataType, GlobalOptions, SourceConfig},
+        shutdown::ShutdownSignal,
+        sinks::blackhole::BlackholeConfig,
+        sources::stdin::StdinConfig,
+        sources::Source,
+        test_util::{start_topology, trace_init},
+        transforms::json_parser::JsonParserConfig,
+        Error, Pipeline,
+    };
+    use futures::{future, FutureExt};
+    use serde::{Deserialize, Serialize};
+    use stream_cancel::{Trigger, Tripwire};
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub struct MockSourceConfig {
+        #[serde(skip)]
+        tripwire: Option<Tripwire>,
+    }
+
+    impl MockSourceConfig {
+        pub fn new() -> (Trigger, Self) {
+            let (trigger, tripwire) = Tripwire::new();
+            (
+                trigger,
+                Self {
+                    tripwire: Some(tripwire),
+                },
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    #[typetag::serde(name = "mock")]
+    impl SourceConfig for MockSourceConfig {
+        async fn build(
+            &self,
+            _name: &str,
+            _globals: &GlobalOptions,
+            shutdown: ShutdownSignal,
+            out: Pipeline,
+        ) -> Result<Source, Error> {
+            Ok(Box::pin(
+                future::select(
+                    shutdown.map(|_| ()).boxed(),
+                    self.tripwire
+                        .clone()
+                        .unwrap()
+                        .then(crate::stream::tripwire_handler)
+                        .boxed(),
+                )
+                .map(|_| std::mem::drop(out))
+                .unit_error(),
+            ))
         }
 
-        let mut rt = runtime();
-
-        let in_addr = next_addr();
-        let out1_addr = next_addr();
-        let out2_addr = next_addr();
-
-        let mut config = Config::empty();
-        config.add_source("in", TcpConfig::new(in_addr));
-        config.add_sink("out", &["in"], TcpSinkConfig::new(out1_addr.to_string()));
-
-        let (mut topology, _crash) = topology::start(config.clone(), &mut rt, false).unwrap();
-
-        // Require-healthy reload with failing healthcheck
-        {
-            config.sinks["out"].inner = Box::new(TcpSinkConfig::new(out2_addr.to_string()));
-
-            topology.reload_config_and_respawn(config.clone(), &mut rt, true);
-
-            let receive = receive_one(&out1_addr, &out2_addr);
-
-            block_on(send_lines(in_addr, vec!["hello".to_string()].into_iter())).unwrap();
-
-            let received = block_on(receive).unwrap();
-            assert_matches!(received, Either::A(_));
+        fn output_type(&self) -> DataType {
+            DataType::Log
         }
 
-        // Require-healthy reload with passing healthcheck
-        {
-            let healthcheck_receiver = receive(&out2_addr);
-
-            config.sinks["out"].inner = Box::new(TcpSinkConfig::new(out2_addr.to_string()));
-
-            topology.reload_config_and_respawn(config.clone(), &mut rt, true);
-            healthcheck_receiver.wait();
-
-            let receive = receive_one(&out1_addr, &out2_addr);
-
-            block_on(send_lines(in_addr, vec!["hello".to_string()].into_iter())).unwrap();
-
-            let received = block_on(receive).unwrap();
-            assert_matches!(received, Either::B(_));
+        fn source_type(&self) -> &'static str {
+            "mock"
         }
+    }
 
-        // non-require-healthy reload with failing healthcheck
-        {
-            config.sinks["out"].inner = Box::new(TcpSinkConfig::new(out1_addr.to_string()));
+    #[tokio::test]
+    async fn closed_source() {
+        let mut old_config = Config::builder();
+        let (trigger_old, source) = MockSourceConfig::new();
+        old_config.add_source("in", source);
+        old_config.add_transform(
+            "trans",
+            &["in"],
+            JsonParserConfig {
+                drop_field: true,
+                ..JsonParserConfig::default()
+            },
+        );
+        old_config.add_sink("out1", &["trans"], BlackholeConfig { print_amount: 1000 });
+        old_config.add_sink("out2", &["trans"], BlackholeConfig { print_amount: 1000 });
 
-            topology.reload_config_and_respawn(config.clone(), &mut rt, false);
+        let mut new_config = Config::builder();
+        let (_trigger_new, source) = MockSourceConfig::new();
+        new_config.add_source("in", source);
+        new_config.add_transform(
+            "trans",
+            &["in"],
+            JsonParserConfig {
+                drop_field: false,
+                ..JsonParserConfig::default()
+            },
+        );
+        new_config.add_sink("out1", &["trans"], BlackholeConfig { print_amount: 1000 });
 
-            let receive = receive_one(&out1_addr, &out2_addr);
+        let (mut topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
 
-            block_on(send_lines(in_addr, vec!["hello".to_string()].into_iter())).unwrap();
+        trigger_old.cancel();
 
-            let received = block_on(receive).unwrap();
-            assert_matches!(received, Either::A(_));
-        }
+        topology.sources_finished().await;
 
-        // disable healthcheck
-        {
-            config.sinks["out"].inner = Box::new(TcpSinkConfig::new(out1_addr.to_string()));
-            config.sinks["out"].healthcheck = false;
+        assert!(topology
+            .reload_config_and_respawn(new_config.build().unwrap())
+            .await
+            .unwrap());
+    }
 
-            topology.reload_config_and_respawn(config.clone(), &mut rt, false);
+    #[tokio::test]
+    async fn remove_sink() {
+        trace_init();
 
-            let receive = receive_one(&out1_addr, &out2_addr);
+        let mut old_config = Config::builder();
+        old_config.add_source("in", StdinConfig::default());
+        old_config.add_transform(
+            "trans",
+            &["in"],
+            JsonParserConfig {
+                drop_field: true,
+                ..JsonParserConfig::default()
+            },
+        );
+        old_config.add_sink("out1", &["trans"], BlackholeConfig { print_amount: 1000 });
+        old_config.add_sink("out2", &["trans"], BlackholeConfig { print_amount: 1000 });
 
-            block_on(send_lines(in_addr, vec!["hello".to_string()].into_iter())).unwrap();
+        let mut new_config = Config::builder();
+        new_config.add_source("in", StdinConfig::default());
+        new_config.add_transform(
+            "trans",
+            &["in"],
+            JsonParserConfig {
+                drop_field: false,
+                ..JsonParserConfig::default()
+            },
+        );
+        new_config.add_sink("out1", &["trans"], BlackholeConfig { print_amount: 1000 });
 
-            let received = block_on(receive).unwrap();
-            assert_matches!(received, Either::A(_));
-        }
+        let (mut topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
+        assert!(topology
+            .reload_config_and_respawn(new_config.build().unwrap())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn remove_transform() {
+        trace_init();
+
+        let mut old_config = Config::builder();
+        old_config.add_source("in", StdinConfig::default());
+        old_config.add_transform(
+            "trans1",
+            &["in"],
+            JsonParserConfig {
+                drop_field: true,
+                ..JsonParserConfig::default()
+            },
+        );
+        old_config.add_transform(
+            "trans2",
+            &["trans1"],
+            JsonParserConfig {
+                drop_field: true,
+                ..JsonParserConfig::default()
+            },
+        );
+        old_config.add_sink("out1", &["trans1"], BlackholeConfig { print_amount: 1000 });
+        old_config.add_sink("out2", &["trans2"], BlackholeConfig { print_amount: 1000 });
+
+        let mut new_config = Config::builder();
+        new_config.add_source("in", StdinConfig::default());
+        new_config.add_transform(
+            "trans1",
+            &["in"],
+            JsonParserConfig {
+                drop_field: false,
+                ..JsonParserConfig::default()
+            },
+        );
+        new_config.add_sink("out1", &["trans1"], BlackholeConfig { print_amount: 1000 });
+
+        let (mut topology, _crash) = start_topology(old_config.build().unwrap(), false).await;
+        assert!(topology
+            .reload_config_and_respawn(new_config.build().unwrap())
+            .await
+            .unwrap());
     }
 }
